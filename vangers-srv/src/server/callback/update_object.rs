@@ -54,7 +54,7 @@ impl OnUpdate_UpdateObject for Server {
             .map(|bind| bind.id())
             .ok_or(UpdateObjectError::PlayerNotBind(client_id))?;
 
-        match game.vanjects.get_mut(&vanject_id) {
+        let (packet, is_non_global, world_id) = match game.vanjects.get_mut(&vanject_id) {
             Some(vanject) => {
                 if vanject.player_bind_id != player_bind_id {
                     Err(UpdateObjectError::NotOwner(vanject_id, player_bind_id))?;
@@ -65,10 +65,20 @@ impl OnUpdate_UpdateObject for Server {
                     .map_err(UpdateObjectError::SliceToVanjectParse)?;
 
                 vanject.player_bind_id = player_bind_id;
-                let packet = Packet::new(Action::UPDATE_OBJECT, &vanject.to_vangers_byte());
-                self.notify_game(client_id, &packet);
+                (
+                    Packet::new(Action::UPDATE_OBJECT, &vanject.to_vangers_byte()),
+                    vanject.is_non_global(),
+                    vanject.get_world() as u8,
+                )
             }
             None => Err(UpdateObjectError::VanjectNotFound(vanject_id))?,
+        };
+
+        let _ = game;
+        if is_non_global {
+            self.notify_world(client_id, world_id, &packet, false);
+        } else {
+            self.notify_game(client_id, &packet);
         }
 
         Ok(OnUpdateOk::Complete)

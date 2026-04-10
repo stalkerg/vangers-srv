@@ -76,7 +76,7 @@ impl OnUpdate_CreateObject for Server {
                 } else {
                     let data = vanject.to_vangers_byte();
                     let answer = Packet::new(Action::UPDATE_OBJECT, &data);
-                    self.notify_game(client_id, &answer);
+                    self.notify_world(client_id, vanject.get_world() as u8, &answer, false);
                 }
             } else {
                 // #IF: vanject.get_type() != NID::VANGER
@@ -85,7 +85,11 @@ impl OnUpdate_CreateObject for Server {
 
                 if !vanject.is_players() {
                     // world->process_create;
-                    self.notify_game(client_id, &answer);
+                    if vanject.is_non_global() {
+                        self.notify_world(client_id, vanject.get_world() as u8, &answer, false);
+                    } else {
+                        self.notify_game(client_id, &answer);
+                    }
                 } else {
                     if vanject.is_non_global() {
                         // world->process_create_inventory()
@@ -94,7 +98,7 @@ impl OnUpdate_CreateObject for Server {
                             &vanject.id.to_le_bytes(),
                             vanject.player_bind_id
                         );
-                        self.notify_game(client_id, &answer);
+                        self.notify_world(client_id, vanject.get_world() as u8, &answer, false);
                     } else {
                         // game->process_create_globals()
                         self.notify_game(client_id, &answer);
