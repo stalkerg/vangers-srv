@@ -4,7 +4,7 @@ use ::tracing::{debug, warn};
 
 use crate::Server;
 use crate::client::ClientID;
-use crate::protocol::{Action, Packet};
+use crate::protocol::{Action, NetTransportSend, Packet};
 use crate::vanject::*;
 
 use super::{OnUpdateError, OnUpdateOk};
