@@ -1,6 +1,8 @@
 use ::tokio::net::TcpListener;
 use ::tokio::sync::mpsc;
+use ::tokio::time;
 use ::tracing::{error, info};
+use std::time::{Duration, Instant};
 
 use crate::client::{Client, ClientID, Connection, MpscData};
 use crate::game::Game;
@@ -29,6 +31,8 @@ pub struct Server {
     uptime: Uptime,
     // get_game_uniq_id: Box<dyn Fn() -> i32>
 }
+
+const DISCONNECTED_PLAYER_TTL: Duration = Duration::from_secs(60);
 
 impl Server {
     pub fn new(conf: ServerConfig) -> Self {
@@ -110,6 +114,31 @@ impl Server {
         self.games_id_uniq
     }
 
+    fn mark_player_disconnected(&mut self, client_id: ClientID) {
+        if let Some(player) = self.games.get_mut_player_by_client_id(client_id) {
+            player.disconnected_until = Some(Instant::now() + DISCONNECTED_PLAYER_TTL);
+        }
+    }
+
+    fn expire_disconnected_players(&mut self) {
+        let now = Instant::now();
+        let expired_client_ids = self
+            .games
+            .iter()
+            .flat_map(|(_, game)| game.players.iter())
+            .filter_map(|player| match player.disconnected_until {
+                Some(deadline) if deadline <= now => Some(player.client_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for client_id in expired_client_ids {
+            if let Err(err) = self.close_socket(&Packet::new(Action::CLOSE_SOCKET, &[]), client_id) {
+                error!("failed to expire disconnected player client_id=`{}`: {}", client_id, err);
+            }
+        }
+    }
+
     pub fn notify(
         &self,
         client_id: ClientID,
@@ -188,6 +217,7 @@ impl Server {
         let endpoint = format!("0.0.0.0:{}", self.conf.port);
         println!("Server is listening on: {}", endpoint);
         let listener = TcpListener::bind(endpoint).await?;
+        let mut disconnected_cleanup_tick = time::interval(Duration::from_secs(1));
 
         ::tokio::spawn(async move {
             // listening for connecting new clients
@@ -205,6 +235,9 @@ impl Server {
 
         loop {
             ::tokio::select! {
+                _ = disconnected_cleanup_tick.tick() => {
+                    self.expire_disconnected_players();
+                }
                 event = event_rx.recv() => {
                     match event {
                         Some(Event::Add(client)) => {
@@ -223,17 +256,8 @@ impl Server {
                 data = clients_rx.recv() => {
                     match data {
                         Some(MpscData(id, Connection::Disconnected)) => {
-                            self.close_socket(&Packet::new(Action::CLOSE_SOCKET, &[]), id)
-                                .ok();
-                            // if let Some(game) = self.get_mut_game_by_clientid(id) {
-                            //     game.players.retain(|p| p.client_id != id)
-                            // }
+                            self.mark_player_disconnected(id);
                             self.clients.retain(|c| c.id != id);
-                            // if let Some(client) = self.clients.iter_mut().find(|c| c.id == id) {
-                            //     client.connection = Connection::Disconnected;
-                            // }
-                            // self.clients
-                            //     .retain(|c| c.connection != Connection::Disconnected);
                         }
                         Some(MpscData(id, connection @ Connection::Authenticated(_))
                         | MpscData(id, connection @ Connection::Connected)) => {
@@ -282,11 +306,12 @@ fn client_ids_in_world(
 
 #[cfg(test)]
 mod tests {
-    use super::client_ids_in_world;
+    use super::{client_ids_in_world, Server};
     use crate::game::{Game, World};
     use crate::player::Player;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn selects_only_players_from_requested_world() {
@@ -306,5 +331,22 @@ mod tests {
 
         let ids = client_ids_in_world(&game, 1, Some(11), true);
         assert_eq!(ids, vec![11]);
+    }
+
+    #[test]
+    fn expire_disconnected_players_forces_close_after_ttl() {
+        let mut srv = Server::new(Default::default());
+        let mut game = Game::new(1);
+        let client_id = 11;
+        game.attach_player(Player::new(client_id));
+        {
+            let player = game.get_mut_player(client_id).unwrap();
+            player.disconnected_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+        srv.games.insert(1, game);
+
+        srv.expire_disconnected_players();
+
+        assert!(srv.games.get(&1).is_none());
     }
 }

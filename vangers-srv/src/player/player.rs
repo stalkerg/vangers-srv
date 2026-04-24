@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use ::tracing::info;
 
@@ -36,6 +37,7 @@ pub struct Player {
     pub pos: Pos<i16>,
 
     pub status: Status,
+    pub disconnected_until: Option<Instant>,
 }
 
 impl Player {
@@ -48,6 +50,7 @@ impl Player {
             world: None,
             pos: Pos::default(),
             status: Status::INITIAL,
+            disconnected_until: None,
         }
     }
 

@@ -75,6 +75,7 @@ impl Action {
         let action_response = match self {
             Action::GAMES_LIST_QUERY => Action::GAMES_LIST_RESPONSE,
             Action::ATTACH_TO_GAME => Action::ATTACH_TO_GAME_RESPONSE,
+            Action::RESTORE_CONNECTION => Action::RESTORE_CONNECTION_RESPONSE,
             Action::SERVER_TIME_QUERY => Action::SERVER_TIME,
             Action::TOTAL_PLAYERS_DATA_QUERY => Action::TOTAL_LIST_OF_PLAYERS_DATA,
             Action::REGISTER_NAME => Action::PLAYERS_NAME,

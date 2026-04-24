@@ -7,6 +7,7 @@ mod games_list_query;
 mod get_game_data;
 mod leave_world;
 mod register_name;
+mod restore_connection;
 mod server_time_query;
 mod set_game_data;
 mod set_player_data;
@@ -23,6 +24,7 @@ use games_list_query::*;
 use get_game_data::*;
 use leave_world::*;
 use register_name::*;
+use restore_connection::*;
 use server_time_query::*;
 use set_game_data::*;
 use set_player_data::*;
@@ -48,6 +50,8 @@ pub enum OnUpdateError {
     AttachToGameError(#[from] AttachToGameError),
     #[error("RegisterNameError: {0}")]
     RegisterNameError(#[from] RegisterNameError),
+    #[error("RestoreConnectionError: {0}")]
+    RestoreConnectionError(#[from] RestoreConnectionError),
     #[error("SetPlayerDataError: {0}")]
     SetPlayerDataError(#[from] SetPlayerDataError),
     #[error("SetGameDataError: {0}")]
@@ -112,6 +116,7 @@ impl OnUpdate for Server {
 
         let result = match packet.action {
             Action::ATTACH_TO_GAME => self.attach_to_game(&packet, client_id),
+            Action::RESTORE_CONNECTION => self.restore_connection(&packet, client_id),
             Action::SERVER_TIME_QUERY => self.server_time_query(&packet, client_id),
             Action::GAMES_LIST_QUERY => self.games_list_query(&packet, client_id),
             Action::TOTAL_PLAYERS_DATA_QUERY => self.total_players_data_query(&packet, client_id),
