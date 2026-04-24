@@ -12,6 +12,7 @@ mod server_time_query;
 mod set_game_data;
 mod set_player_data;
 mod set_world;
+mod top_list_query;
 mod total_players_data_query;
 mod update_object;
 
@@ -29,6 +30,7 @@ use server_time_query::*;
 use set_game_data::*;
 use set_player_data::*;
 use set_world::*;
+use top_list_query::*;
 use total_players_data_query::*;
 use update_object::*;
 
@@ -74,6 +76,8 @@ pub enum OnUpdateError {
     LeaveWorldError(#[from] LeaveWorldError),
     #[error("CloseSocketError: {0}")]
     CloseSocketError(#[from] CloseSocketError),
+    #[error("TopListQueryError: {0}")]
+    TopListQueryError(#[from] TopListQueryError),
 }
 
 fn not_implemented_errdisplay(packet: &Packet) -> String {
@@ -119,6 +123,7 @@ impl OnUpdate for Server {
             Action::RESTORE_CONNECTION => self.restore_connection(&packet, client_id),
             Action::SERVER_TIME_QUERY => self.server_time_query(&packet, client_id),
             Action::GAMES_LIST_QUERY => self.games_list_query(&packet, client_id),
+            Action::TOP_LIST_QUERY => self.top_list_query(&packet, client_id),
             Action::TOTAL_PLAYERS_DATA_QUERY => self.total_players_data_query(&packet, client_id),
             Action::REGISTER_NAME => self.register_name(&packet, client_id),
             Action::SET_PLAYER_DATA => self.set_player_data(&packet, client_id),

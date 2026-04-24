@@ -74,6 +74,7 @@ impl Action {
     pub fn request_to_response(&self) -> Option<Self> {
         let action_response = match self {
             Action::GAMES_LIST_QUERY => Action::GAMES_LIST_RESPONSE,
+            Action::TOP_LIST_QUERY => Action::TOP_LIST_RESPONSE,
             Action::ATTACH_TO_GAME => Action::ATTACH_TO_GAME_RESPONSE,
             Action::RESTORE_CONNECTION => Action::RESTORE_CONNECTION_RESPONSE,
             Action::SERVER_TIME_QUERY => Action::SERVER_TIME,

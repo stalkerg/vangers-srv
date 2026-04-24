@@ -43,6 +43,10 @@ impl Body {
     fn get_base_struct_size() -> usize {
         1 + 1 + 1 + 1 + 4 + 4 + 1 + 2 + 2 + 4 + 4
     }
+
+    pub fn rating(&self) -> f32 {
+        self.rating
+    }
 }
 
 impl NetTransportSend for Body {
