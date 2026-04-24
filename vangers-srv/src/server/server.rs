@@ -192,8 +192,8 @@ impl Server {
         ::tokio::spawn(async move {
             // listening for connecting new clients
             loop {
-                if let Ok((stream, _)) = listener.accept().await {
-                    info!("====== new client connected ======");
+                if let Ok((stream, addr)) = listener.accept().await {
+                    info!(peer=%addr, "====== new client connected ======");
                     let client = Client::new(stream, client_tx.clone());
                     if event_tx.send(Event::Add(client)).await.is_err() {
                         error!("Terminate tcp-listener because of `event_rx` was closed.");

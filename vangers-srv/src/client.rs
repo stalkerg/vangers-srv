@@ -56,20 +56,28 @@ impl Client {
     fn event_loop(&self, mut stream: TcpStream, mut rx_server: Receiver<Vec<u8>>) {
         let tx_server = self.tx_server.clone();
         let id = self.id;
+        let peer = stream
+            .peer_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
 
         ::tokio::spawn(async move {
             let protocol = match auth(&mut stream).await {
                 Ok(protocol_version) => protocol_version,
                 Err(err) => {
-                    info!("auth failed: {}", err);
-                    stream.write(b"Auth failed, bye-bye\0").await.unwrap();
-                    stream.shutdown().await.unwrap();
+                    info!(peer=%peer, "auth failed: {}", err);
+                    if let Err(write_err) = stream.write_all(b"Auth failed, bye-bye\0").await {
+                        warn!(peer=%peer, "failed to send auth failure reply: {write_err:?}");
+                    }
+                    if let Err(shutdown_err) = stream.shutdown().await {
+                        warn!(peer=%peer, "failed to shutdown auth-failed socket: {shutdown_err:?}");
+                    }
                     if tx_server
                         .send(MpscData(id, Connection::Disconnected))
                         .await
                         .is_err()
                     {
-                        warn!("Can't send `Connection::Disconnected` event to server receiver");
+                        warn!(peer=%peer, "Can't send `Connection::Disconnected` event to server receiver");
                     }
                     return;
                 }
@@ -100,12 +108,14 @@ impl Client {
             loop {
                 match sr.read(&mut buff[buff_offset..]).await {
                     Ok(0) => {
-                        info!("Connection closed by client");
-                        tx_server
+                        info!(peer=%peer, "Connection closed by client");
+                        if tx_server
                             .send(MpscData(id, Connection::Disconnected))
                             .await
-                            .ok()
-                            .unwrap();
+                            .is_err()
+                        {
+                            warn!(peer=%peer, "Can't send `Connection::Disconnected` event to server receiver");
+                        }
                         break;
                     }
                     Ok(n) => {
@@ -166,12 +176,14 @@ impl Client {
                         buff_offset = buff_readable_size - offset;
                     }
                     Err(err) => {
-                        error!("Connection closed (I/O ERROR): {err:?}");
-                        tx_server
+                        error!(peer=%peer, "Connection closed (I/O ERROR): {err:?}");
+                        if tx_server
                             .send(MpscData(id, Connection::Disconnected))
                             .await
-                            .ok()
-                            .unwrap();
+                            .is_err()
+                        {
+                            warn!(peer=%peer, "Can't send `Connection::Disconnected` event to server receiver");
+                        }
                         break;
                     }
                 };
@@ -217,37 +229,54 @@ enum AuthError {
 async fn auth(stream: &mut TcpStream) -> Result<u8, AuthError> {
     use AuthError::*;
 
-    let mut buff = [0u8; 256];
+    const PROTOCOL_VERSION: u8 = 3;
+    const HS_TOTAL_LEN: usize = HS_IN.len() + 2; // magic + '\0' + version
 
-    match stream.read(&mut buff).await {
-        Ok(_n @ 0) => Err(ClosedByClient)?,
-        Ok(_n) => {
-            if let Some(pos) = buff.iter().position(|&b| b == 0) {
-                if !HS_IN.eq(&buff[0..pos]) {
-                    Err(HsUnexpectedRequestHeader)?
-                }
+    let mut received = Vec::with_capacity(HS_TOTAL_LEN);
+    let mut buff = [0u8; 64];
 
-                let protocol_version = buff[pos + 1];
+    loop {
+        let n = match stream.read(&mut buff).await {
+            Ok(0) => Err(ClosedByClient)?,
+            Ok(n) => n,
+            Err(_e) => Err(Connection)?,
+        };
 
-                if protocol_version != 3 {
-                    Err(HsUnexpectedProtocolVersion(&[3], protocol_version))?
-                }
+        received.extend_from_slice(&buff[..n]);
 
-                let send = HS_OUT
-                    .iter()
-                    .chain(&[0u8, protocol_version])
-                    .copied()
-                    .collect::<Vec<_>>();
-
-                if let Err(_e) = stream.write(&send).await {
-                    Err(HsResponse)?
-                }
-
-                Ok(protocol_version)
-            } else {
-                Err(HsZeroTerminated)
-            }
+        let prefix_len = received.len().min(HS_IN.len());
+        if received[..prefix_len] != HS_IN[..prefix_len] {
+            Err(HsUnexpectedRequestHeader)?
         }
-        _ => Err(Connection),
+
+        if received.len() < HS_IN.len() {
+            continue;
+        }
+
+        if received.len() > HS_IN.len() && received[HS_IN.len()] != 0 {
+            Err(HsZeroTerminated)?
+        }
+
+        if received.len() < HS_TOTAL_LEN {
+            continue;
+        }
+
+        let protocol_version = received[HS_IN.len() + 1];
+
+        if protocol_version != PROTOCOL_VERSION {
+            Err(HsUnexpectedProtocolVersion(&[PROTOCOL_VERSION], protocol_version))?
+        }
+
+        let send = HS_OUT
+            .iter()
+            .chain(&[0u8, protocol_version])
+            .copied()
+            .collect::<Vec<_>>();
+
+        if let Err(_e) = stream.write_all(&send).await {
+            Err(HsResponse)?
+        }
+
+        return Ok(protocol_version);
     }
 }
