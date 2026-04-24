@@ -1,4 +1,5 @@
 use ::tokio::net::TcpListener;
+use ::tokio::signal;
 use ::tokio::sync::mpsc;
 use ::tokio::time;
 use ::tracing::{error, info};
@@ -33,6 +34,29 @@ pub struct Server {
 }
 
 const DISCONNECTED_PLAYER_TTL: Duration = Duration::from_secs(60);
+
+async fn wait_for_shutdown_signal() -> Result<&'static str, std::io::Error> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigterm = signal(SignalKind::terminate())?;
+
+        ::tokio::select! {
+            res = signal::ctrl_c() => {
+                res?;
+                Ok("SIGINT")
+            }
+            _ = sigterm.recv() => Ok("SIGTERM"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await?;
+        Ok("SIGINT")
+    }
+}
 
 impl Server {
     pub fn new(conf: ServerConfig) -> Self {
@@ -218,6 +242,8 @@ impl Server {
         println!("Server is listening on: {}", endpoint);
         let listener = TcpListener::bind(endpoint).await?;
         let mut disconnected_cleanup_tick = time::interval(Duration::from_secs(1));
+        let listener_tx = event_tx.clone();
+        let signal_tx = event_tx.clone();
 
         ::tokio::spawn(async move {
             // listening for connecting new clients
@@ -225,9 +251,26 @@ impl Server {
                 if let Ok((stream, addr)) = listener.accept().await {
                     info!(peer=%addr, "====== new client connected ======");
                     let client = Client::new(stream, client_tx.clone());
-                    if event_tx.send(Event::Add(client)).await.is_err() {
+                    if listener_tx.send(Event::Add(client)).await.is_err() {
                         error!("Terminate tcp-listener because of `event_rx` was closed.");
                         break;
+                    }
+                }
+            }
+        });
+
+        ::tokio::spawn(async move {
+            match wait_for_shutdown_signal().await {
+                Ok(sig) => {
+                    info!(signal=%sig, "shutdown signal received");
+                    if signal_tx.send(Event::Halt).await.is_err() {
+                        error!("failed to deliver shutdown event to main server loop");
+                    }
+                }
+                Err(err) => {
+                    error!("failed to install shutdown signal handlers: {err}");
+                    if signal_tx.send(Event::Halt).await.is_err() {
+                        error!("failed to deliver shutdown event after signal handler error");
                     }
                 }
             }
