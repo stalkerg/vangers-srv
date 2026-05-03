@@ -52,6 +52,11 @@ pub fn is_non_static(id: i32) -> bool {
     (id as u32 & (1 << 31)) == 0u32
 }
 
+#[inline(always)]
+pub fn is_static_world_vanject(id: i32) -> bool {
+    is_non_global_vanject(id) && !is_non_static(id)
+}
+
 #[allow(dead_code)]
 #[inline(always)]
 pub fn is_players_vanject(id: i32) -> bool {
@@ -302,6 +307,18 @@ impl Vanject {
 
     #[allow(dead_code)]
     #[inline(always)]
+    pub fn is_non_static(&self) -> bool {
+        is_non_static(self.id)
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn is_static_world_state(&self) -> bool {
+        is_static_world_vanject(self.id)
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
     pub fn get_world(&self) -> i32 {
         get_world(self.id)
     }
@@ -402,6 +419,35 @@ mod test {
         assert_eq!(true, is_players_vanject(a));
         assert_eq!(false, is_private_vanject(a));
         assert_eq!(true, is_non_global_vanject(a));
+    }
+
+    #[test]
+    fn classifies_static_world_state_objects() {
+        let make_id = |nid: i32| (1 << 26) | (2 << 22) | nid | 1;
+
+        let sensor = make_id(NID::SENSOR);
+        let tnt = make_id(NID::TNT);
+        let terrain = make_id(NID::TERRAIN);
+        let slot = (1 << 26) | (2 << 22) | NID::SLOT | 1;
+        let shell = (1 << 26) | (2 << 22) | NID::SHELL | 1;
+        let vanger = (1 << 26) | (2 << 22) | NID::VANGER | 1;
+        let stuff = (1 << 26) | (2 << 22) | NID::STUFF | 1;
+
+        assert!(!is_non_static(sensor));
+        assert!(!is_non_static(tnt));
+        assert!(!is_non_static(terrain));
+        assert!(is_static_world_vanject(sensor));
+        assert!(is_static_world_vanject(tnt));
+        assert!(is_static_world_vanject(terrain));
+
+        assert!(is_non_static(slot));
+        assert!(is_non_static(shell));
+        assert!(is_non_static(vanger));
+        assert!(is_non_static(stuff));
+        assert!(!is_static_world_vanject(slot));
+        assert!(!is_static_world_vanject(shell));
+        assert!(!is_static_world_vanject(vanger));
+        assert!(!is_static_world_vanject(stuff));
     }
 
     mod create_from_slice {

@@ -57,7 +57,9 @@ impl OnUpdate_LeaveWorld for Server {
         let delete = game
             .vanjects
             .iter()
-            .filter(|(_, v)| v.get_station() == player_bind_id as i32 && v.is_non_global())
+            .filter(|(_, v)| {
+                v.get_station() == player_bind_id as i32 && v.is_non_global() && v.is_non_static()
+            })
             .map(|(&id, v)| {
                 (
                     id,
@@ -106,9 +108,26 @@ mod tests {
     use super::*;
     use crate::game::{Game, World};
     use crate::player::Player;
-    use crate::vanject::Vanject;
+    use crate::vanject::{NID, Vanject};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    fn make_vanject(id: i32, player_bind_id: u8) -> Vanject {
+        let mut vanject = Vanject::create_from_slice(
+            &std::iter::empty()
+                .chain(&id.to_le_bytes())
+                .chain(&6i32.to_le_bytes())
+                .chain(&10i16.to_le_bytes())
+                .chain(&20i16.to_le_bytes())
+                .chain(&15i16.to_le_bytes())
+                .chain(&[1, 2, 3])
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        vanject.player_bind_id = player_bind_id;
+        vanject
+    }
 
     #[test]
     fn leave_world_removes_player_owned_non_private_objects_too() {
@@ -139,6 +158,37 @@ mod tests {
             .unwrap();
 
         let game = srv.games.get(&1).unwrap();
+        assert!(!game.vanjects.contains_key(&slot_id));
+    }
+
+    #[test]
+    fn leave_world_preserves_static_world_objects() {
+        let mut srv = Server::new(Default::default());
+        let mut game = Game::new(1);
+        let client_id: ClientID = 11;
+        game.attach_player(Player::new(client_id));
+
+        let world = Rc::new(RefCell::new(World::new(1, 100)));
+        game.worlds.push(Rc::clone(&world));
+        game.place_player(client_id, &world.borrow());
+
+        let station = 1 << 26;
+        let world_bits = 1 << 22;
+        let sensor_id = station | world_bits | NID::SENSOR | 1;
+        let tnt_id = station | world_bits | NID::TNT | 2;
+        let slot_id = station | world_bits | NID::SLOT | 3;
+
+        game.vanjects.insert(sensor_id, make_vanject(sensor_id, 1));
+        game.vanjects.insert(tnt_id, make_vanject(tnt_id, 1));
+        game.vanjects.insert(slot_id, make_vanject(slot_id, 1));
+
+        srv.games.insert(1, game);
+        srv.leave_world(&Packet::new(Action::LEAVE_WORLD, &[]), client_id)
+            .unwrap();
+
+        let game = srv.games.get(&1).unwrap();
+        assert!(game.vanjects.contains_key(&sensor_id));
+        assert!(game.vanjects.contains_key(&tnt_id));
         assert!(!game.vanjects.contains_key(&slot_id));
     }
 }
