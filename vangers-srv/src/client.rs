@@ -2,7 +2,7 @@ use std::convert::TryFrom;
 
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ::tokio::net::TcpStream;
-use ::tokio::sync::mpsc::{self, Receiver};
+use ::tokio::sync::mpsc::{self, Receiver, error::TrySendError};
 use ::tracing::{error, info, warn};
 
 use super::protocol::*;
@@ -43,14 +43,17 @@ pub struct Client {
 
 impl Client {
     pub fn send(&self, packet: &Packet) {
-        let tx = self.tx_client.clone();
-        let packet = packet.as_bytes();
+        let action = packet.action;
 
-        ::tokio::spawn(async move {
-            if tx.send(packet).await.is_err() {
-                warn!("Error: send data via mpsc (Server => SendClient)");
+        match self.tx_client.try_send(packet.as_bytes()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                warn!(client_id = self.id, action = ?action, "client outbound queue is full; dropping packet");
             }
-        });
+            Err(TrySendError::Closed(_)) => {
+                warn!(client_id = self.id, action = ?action, "client outbound queue is closed; dropping packet");
+            }
+        }
     }
 
     fn event_loop(&self, mut stream: TcpStream, mut rx_server: Receiver<Vec<u8>>) {
@@ -96,7 +99,7 @@ impl Client {
 
             ::tokio::spawn(async move {
                 while let Some(data) = rx_server.recv().await {
-                    if let Err(err) = sw.write(&data).await {
+                    if let Err(err) = sw.write_all(&data).await {
                         error!("client::event_loop: error sending data to client: {err:?}");
                         break;
                     }
@@ -197,6 +200,10 @@ impl Client {
         let id = ::rand::random();
         let (tx_client, rx_server) = mpsc::channel::<Vec<u8>>(1000);
 
+        if let Err(err) = stream.set_nodelay(true) {
+            warn!(client_id = id, "failed to enable TCP_NODELAY: {err:?}");
+        }
+
         let client = Self {
             protocol: 0,
             id,
@@ -264,7 +271,10 @@ async fn auth(stream: &mut TcpStream) -> Result<u8, AuthError> {
         let protocol_version = received[HS_IN.len() + 1];
 
         if protocol_version != PROTOCOL_VERSION {
-            Err(HsUnexpectedProtocolVersion(&[PROTOCOL_VERSION], protocol_version))?
+            Err(HsUnexpectedProtocolVersion(
+                &[PROTOCOL_VERSION],
+                protocol_version,
+            ))?
         }
 
         let send = HS_OUT
