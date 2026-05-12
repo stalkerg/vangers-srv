@@ -1,6 +1,6 @@
-use crate::Server;
 use crate::protocol::{Action, Packet};
 use crate::vanject::VanjectError;
+use crate::Server;
 use crate::{client::ClientID, utils::slice_le_to_i32};
 
 use super::{OnUpdateError, OnUpdateOk};
@@ -81,7 +81,10 @@ impl OnUpdate_UpdateObject for Server {
                     }
                 }
 
-                if vanject.is_non_static() && vanject.player_bind_id != player_bind_id {
+                if is_non_global
+                    && vanject.is_non_static()
+                    && vanject.player_bind_id != player_bind_id
+                {
                     Err(UpdateObjectError::NotOwner(vanject_id, player_bind_id))?;
                 }
 
@@ -115,7 +118,7 @@ mod tests {
     use super::*;
     use crate::game::{Game, World};
     use crate::player::Player;
-    use crate::vanject::{NID, Vanject};
+    use crate::vanject::{Vanject, NID};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -223,6 +226,33 @@ mod tests {
 
         let game = srv.games.get(&1).unwrap();
         let vanject = game.vanjects.get(&tnt_id).unwrap();
+        assert_eq!(vanject.time, 7);
+        assert_eq!(vanject.pos.x, 11);
+        assert_eq!(vanject.pos.y, 21);
+        assert_eq!(vanject.body, vec![9, 9, 9, 9]);
+        assert_eq!(vanject.player_bind_id, 2);
+    }
+
+    #[test]
+    fn allows_global_object_update_from_non_owner_without_world() {
+        let mut srv = Server::new(Default::default());
+        let mut game = Game::new(1);
+
+        let owner_client: ClientID = 11;
+        let other_client: ClientID = 22;
+        game.attach_player(Player::new(owner_client));
+        game.attach_player(Player::new(other_client));
+
+        let global_id = make_id(0, 1, NID::GLOBAL, 83);
+        game.vanjects.insert(global_id, make_vanject(global_id, 1));
+
+        srv.games.insert(1, game);
+
+        let packet = make_update_packet(global_id, 7, 11, 21, &[9, 9, 9, 9]);
+        srv.update_object(&packet, other_client).unwrap();
+
+        let game = srv.games.get(&1).unwrap();
+        let vanject = game.vanjects.get(&global_id).unwrap();
         assert_eq!(vanject.time, 7);
         assert_eq!(vanject.pos.x, 11);
         assert_eq!(vanject.pos.y, 21);
