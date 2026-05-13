@@ -35,6 +35,7 @@ pub struct Player {
     pub world: Option<Rc<RefCell<World>>>,
 
     pub pos: Pos<i16>,
+    pub screen_y_half_size: i16,
 
     pub status: Status,
     pub disconnected_until: Option<Instant>,
@@ -49,6 +50,7 @@ impl Player {
             body: None,
             world: None,
             pos: Pos::default(),
+            screen_y_half_size: 0,
             status: Status::INITIAL,
             disconnected_until: None,
         }

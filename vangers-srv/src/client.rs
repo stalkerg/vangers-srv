@@ -43,15 +43,65 @@ pub struct Client {
 
 impl Client {
     pub fn send(&self, packet: &Packet) {
+        if packet.action.is_lossy_realtime() {
+            self.send_lossy(packet);
+        } else {
+            self.send_reliable(packet);
+        }
+    }
+
+    pub fn send_reliable(&self, packet: &Packet) {
+        let action = packet.action;
+        let data = packet.as_bytes();
+
+        match self.tx_client.try_send(data) {
+            Ok(()) => {}
+            Err(TrySendError::Full(data)) => {
+                let tx_client = self.tx_client.clone();
+                let client_id = self.id;
+                warn!(
+                    client_id,
+                    action = ?action,
+                    "client outbound queue is full; scheduling reliable packet"
+                );
+                ::tokio::spawn(async move {
+                    if tx_client.send(data).await.is_err() {
+                        warn!(
+                            client_id,
+                            action = ?action,
+                            "client outbound queue is closed; reliable packet dropped"
+                        );
+                    }
+                });
+            }
+            Err(TrySendError::Closed(_)) => {
+                warn!(
+                    client_id = self.id,
+                    action = ?action,
+                    "client outbound queue is closed; reliable packet dropped"
+                );
+            }
+        }
+    }
+
+    pub fn send_lossy(&self, packet: &Packet) {
         let action = packet.action;
 
         match self.tx_client.try_send(packet.as_bytes()) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
-                warn!(client_id = self.id, action = ?action, "client outbound queue is full; dropping packet");
+                warn!(
+                    client_id = self.id,
+                    action = ?action,
+                    "client outbound queue is full; dropping lossy realtime packet"
+                );
             }
             Err(TrySendError::Closed(_)) => {
-                warn!(client_id = self.id, action = ?action, "client outbound queue is closed; dropping packet");
+                warn!(
+                    client_id = self.id,
+                    action = ?action,
+                    "client outbound queue is closed; dropping lossy realtime packet"
+                );
             }
         }
     }
@@ -288,5 +338,61 @@ async fn auth(stream: &mut TcpStream) -> Result<u8, AuthError> {
         }
 
         return Ok(protocol_version);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use ::tokio::sync::mpsc;
+
+    use super::*;
+
+    fn test_client(queue_size: usize) -> (Client, mpsc::Receiver<Vec<u8>>) {
+        let (tx_server, _rx_server) = mpsc::channel::<MpscData>(1);
+        let (tx_client, rx_client) = mpsc::channel::<Vec<u8>>(queue_size);
+
+        (
+            Client {
+                id: 1,
+                connection: Connection::Connected,
+                protocol: 3,
+                tx_server,
+                tx_client,
+            },
+            rx_client,
+        )
+    }
+
+    #[test]
+    fn lossy_realtime_packet_is_dropped_when_queue_is_full() {
+        let (client, mut rx_client) = test_client(1);
+        let first = Packet::new(Action::UPDATE_OBJECT, &[1]);
+        let second = Packet::new(Action::UPDATE_OBJECT, &[2]);
+
+        client.send(&first);
+        client.send(&second);
+
+        assert_eq!(rx_client.try_recv().unwrap(), first.as_bytes());
+        assert!(rx_client.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reliable_packet_waits_when_queue_is_full() {
+        let (client, mut rx_client) = test_client(1);
+        let first = Packet::new(Action::PLAYERS_DATA, &[1]);
+        let second = Packet::new(Action::DELETE_OBJECT, &[2]);
+
+        client.send(&first);
+        client.send(&second);
+
+        assert_eq!(rx_client.recv().await.unwrap(), first.as_bytes());
+
+        let second_bytes = ::tokio::time::timeout(Duration::from_secs(1), rx_client.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_bytes, second.as_bytes());
     }
 }

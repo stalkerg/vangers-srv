@@ -70,6 +70,12 @@ pub enum Action {
 }
 
 impl Action {
+    /// Returns true for packets that describe rapidly changing realtime state
+    /// and may be dropped when a client connection is already overloaded.
+    pub fn is_lossy_realtime(self) -> bool {
+        matches!(self, Action::UPDATE_OBJECT | Action::SERVER_TIME)
+    }
+
     /// Converts `action` from request-type to response-type if possible.
     pub fn request_to_response(&self) -> Option<Self> {
         let action_response = match self {
@@ -220,6 +226,28 @@ mod test {
         // change `UNDEFINED_ACTION` constant to something else.
         // Actually, the line tests for correct running tests below :)
         assert!(Action::from_u8(UNDEFINED_ACTION).is_none());
+    }
+
+    #[test]
+    fn realtime_policy_marks_only_replaceable_updates_as_lossy() {
+        assert!(Action::UPDATE_OBJECT.is_lossy_realtime());
+        assert!(Action::SERVER_TIME.is_lossy_realtime());
+
+        for action in [
+            Action::PLAYERS_DATA,
+            Action::PLAYERS_WORLD,
+            Action::TOTAL_LIST_OF_PLAYERS_DATA,
+            Action::SET_WORLD_RESPONSE,
+            Action::DELETE_OBJECT,
+            Action::CREATE_OBJECT,
+            Action::HIDE_OBJECT,
+            Action::DIRECT_RECEIVING,
+        ] {
+            assert!(
+                !action.is_lossy_realtime(),
+                "{action:?} is critical state and must not be sent as lossy realtime data"
+            );
+        }
     }
 
     const DATA_UNDEFINED: &'static [u8] = &[0x04, 0x00, UNDEFINED_ACTION, 0xAA, 0xAA, 0xAA];

@@ -11,6 +11,7 @@ mod restore_connection;
 mod server_time_query;
 mod set_game_data;
 mod set_player_data;
+mod set_position;
 mod set_world;
 mod top_list_query;
 mod total_players_data_query;
@@ -29,6 +30,7 @@ use restore_connection::*;
 use server_time_query::*;
 use set_game_data::*;
 use set_player_data::*;
+use set_position::*;
 use set_world::*;
 use top_list_query::*;
 use total_players_data_query::*;
@@ -56,6 +58,8 @@ pub enum OnUpdateError {
     RestoreConnectionError(#[from] RestoreConnectionError),
     #[error("SetPlayerDataError: {0}")]
     SetPlayerDataError(#[from] SetPlayerDataError),
+    #[error("SetPositionError: {0}")]
+    SetPositionError(#[from] SetPositionError),
     #[error("SetGameDataError: {0}")]
     SetGameDataError(#[from] SetGameDataError),
     #[error("GetGameDataError: {0}")]
@@ -127,6 +131,7 @@ impl OnUpdate for Server {
             Action::TOTAL_PLAYERS_DATA_QUERY => self.total_players_data_query(&packet, client_id),
             Action::REGISTER_NAME => self.register_name(&packet, client_id),
             Action::SET_PLAYER_DATA => self.set_player_data(&packet, client_id),
+            Action::SET_POSITION => self.set_position(&packet, client_id),
             Action::SET_GAME_DATA => self.set_game_data(&packet, client_id),
             Action::GET_GAME_DATA => self.get_game_data(&packet, client_id),
             Action::CREATE_OBJECT => self.create_object(&packet, client_id),
