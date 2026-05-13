@@ -6,6 +6,25 @@ use crate::protocol::{Action, Packet};
 
 use super::{OnUpdateError, OnUpdateOk};
 
+fn should_delete_on_leave_world(v: &crate::vanject::Vanject, player_bind_id: u8) -> bool {
+    let player_station_id = player_bind_id as i32;
+
+    // Original C++ server clears two different groups on world leave:
+    //
+    // 1. the leaving player's inventory list;
+    // 2. private objects whose network id belongs to this player/station.
+    //
+    // A vanject network station is not the same thing as current ownership: an item
+    // may keep the creator's/station's NetID after another player has picked it up.
+    // Deleting every non-static object by station would therefore erase items from
+    // another player's trunk when the original station dies or leaves the world.
+    let is_players_inventory_object =
+        v.is_non_global() && v.is_players() && v.player_bind_id == player_bind_id;
+    let is_private_station_object = v.get_station() == player_station_id && v.is_private();
+
+    is_players_inventory_object || is_private_station_object
+}
+
 #[derive(Debug, ::thiserror::Error)]
 pub enum LeaveWorldError {
     #[error("player with client_id `{0}` not found")]
@@ -57,9 +76,7 @@ impl OnUpdate_LeaveWorld for Server {
         let delete = game
             .vanjects
             .iter()
-            .filter(|(_, v)| {
-                v.get_station() == player_bind_id as i32 && v.is_non_global() && v.is_non_static()
-            })
+            .filter(|(_, v)| should_delete_on_leave_world(v, player_bind_id))
             .map(|(&id, v)| {
                 (
                     id,
@@ -112,6 +129,10 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    fn make_id(station: i32, world: i32, nid: i32, counter: i32) -> i32 {
+        (station << 26) | (world << 22) | nid | counter
+    }
+
     fn make_vanject(id: i32, player_bind_id: u8) -> Vanject {
         let mut vanject = Vanject::create_from_slice(
             &std::iter::empty()
@@ -159,6 +180,81 @@ mod tests {
 
         let game = srv.games.get(&1).unwrap();
         assert!(!game.vanjects.contains_key(&slot_id));
+    }
+
+    #[test]
+    fn leave_world_preserves_inventory_now_owned_by_another_player() {
+        let mut srv = Server::new(Default::default());
+        let mut game = Game::new(1);
+        let leaving_client_id: ClientID = 11;
+        let other_client_id: ClientID = 22;
+        game.attach_player(Player::new(leaving_client_id));
+        game.attach_player(Player::new(other_client_id));
+
+        let world = Rc::new(RefCell::new(World::new(1, 100)));
+        game.worlds.push(Rc::clone(&world));
+        game.place_player(leaving_client_id, &world.borrow());
+
+        let station = 1;
+        let world_id = 1;
+        let slot_id = make_id(station, world_id, NID::SLOT, 3);
+
+        // The network id still belongs to station 1, but the server-side current
+        // inventory owner is player 2. This is the "item in another player's
+        // trunk" case: leaving player 1 must not delete it.
+        game.vanjects.insert(slot_id, make_vanject(slot_id, 2));
+
+        srv.games.insert(1, game);
+        srv.leave_world(&Packet::new(Action::LEAVE_WORLD, &[]), leaving_client_id)
+            .unwrap();
+
+        let game = srv.games.get(&1).unwrap();
+        assert!(game.vanjects.contains_key(&slot_id));
+    }
+
+    #[test]
+    fn leave_world_preserves_dropped_world_stuff_created_by_player() {
+        let mut srv = Server::new(Default::default());
+        let mut game = Game::new(1);
+        let client_id: ClientID = 11;
+        game.attach_player(Player::new(client_id));
+
+        let world = Rc::new(RefCell::new(World::new(1, 100)));
+        game.worlds.push(Rc::clone(&world));
+        game.place_player(client_id, &world.borrow());
+
+        let stuff_id = make_id(1, 1, NID::STUFF, 4);
+        game.vanjects.insert(stuff_id, make_vanject(stuff_id, 1));
+
+        srv.games.insert(1, game);
+        srv.leave_world(&Packet::new(Action::LEAVE_WORLD, &[]), client_id)
+            .unwrap();
+
+        let game = srv.games.get(&1).unwrap();
+        assert!(game.vanjects.contains_key(&stuff_id));
+    }
+
+    #[test]
+    fn leave_world_removes_private_station_objects() {
+        let mut srv = Server::new(Default::default());
+        let mut game = Game::new(1);
+        let client_id: ClientID = 11;
+        game.attach_player(Player::new(client_id));
+
+        let world = Rc::new(RefCell::new(World::new(1, 100)));
+        game.worlds.push(Rc::clone(&world));
+        game.place_player(client_id, &world.borrow());
+
+        let private_id = make_id(1, 1, NID::VANGER, 5);
+        game.vanjects
+            .insert(private_id, make_vanject(private_id, 2));
+
+        srv.games.insert(1, game);
+        srv.leave_world(&Packet::new(Action::LEAVE_WORLD, &[]), client_id)
+            .unwrap();
+
+        let game = srv.games.get(&1).unwrap();
+        assert!(!game.vanjects.contains_key(&private_id));
     }
 
     #[test]
