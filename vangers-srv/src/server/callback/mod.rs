@@ -36,7 +36,7 @@ use top_list_query::*;
 use total_players_data_query::*;
 use update_object::*;
 
-use ::tracing::{debug, error, info, trace, warn};
+use ::tracing::{Span, debug, error, field, info, trace, warn};
 
 use crate::client::ClientID;
 use crate::protocol::{Action, Packet};
@@ -117,9 +117,14 @@ impl OnUpdate for Server {
             p.event_size = packet.event_size,
             p.real_data_size = packet.data.len(),
             client_id = client_id,
+            player_bind_id = field::Empty,
+            player_name = field::Empty,
+            game_id = field::Empty,
+            player_world = field::Empty,
         )
     )]
     fn on_update(&mut self, client_id: ClientID, packet: Packet) {
+        record_action_context(self, client_id);
         view("[<-]", &packet, &self.conf);
 
         let result = match packet.action {
@@ -165,6 +170,33 @@ impl OnUpdate for Server {
             }
             Err(err) => error!("{}", err),
         }
+    }
+}
+
+fn record_action_context(server: &Server, client_id: ClientID) {
+    let span = Span::current();
+    if let Some(game) = server.get_game_by_clientid(client_id) {
+        span.record("game_id", game.id as u64);
+        if let Some(player) = game.get_player(client_id) {
+            if let Some(bind) = player.bind {
+                span.record("player_bind_id", bind.id() as u64);
+            }
+            if let Some(auth) = &player.auth {
+                span.record("player_name", field::display(auth.name_utf8()));
+            } else {
+                span.record("player_name", "<none>");
+            }
+            if let Some(world) = &player.world {
+                span.record("player_world", world.borrow().id as u64);
+            } else {
+                span.record("player_world", "<none>");
+            }
+        }
+    } else {
+        span.record("game_id", "<none>");
+        span.record("player_bind_id", "<none>");
+        span.record("player_name", "<none>");
+        span.record("player_world", "<none>");
     }
 }
 

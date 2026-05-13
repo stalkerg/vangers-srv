@@ -1,7 +1,8 @@
-use crate::protocol::{Action, Packet};
-use crate::vanject::VanjectError;
 use crate::Server;
+use crate::protocol::{Action, Packet};
+use crate::vanject::{DecodedVanjectId, VanjectError};
 use crate::{client::ClientID, utils::slice_le_to_i32};
+use ::tracing::{info, warn};
 
 use super::{OnUpdateError, OnUpdateOk};
 
@@ -46,6 +47,7 @@ impl OnUpdate_UpdateObject for Server {
         }
 
         let vanject_id = slice_le_to_i32(&packet.data[0..4]);
+        let decoded = DecodedVanjectId::new(vanject_id);
 
         let game = self
             .get_mut_game_by_clientid(client_id)
@@ -68,11 +70,33 @@ impl OnUpdate_UpdateObject for Server {
             Some(vanject) => {
                 let is_non_global = vanject.is_non_global();
                 let world_id = vanject.get_world() as u8;
+                let stored_owner = vanject.player_bind_id;
+                let stored_world = world_id;
 
                 if is_non_global {
                     let player_world_id =
                         player_world_id.ok_or(UpdateObjectError::PlayerWorldEmpty(client_id))?;
                     if player_world_id != world_id {
+                        warn!(
+                            action = "UPDATE_OBJECT",
+                            id = decoded.id,
+                            id_hex = %format_args!("0x{:08X}", decoded.id as u32),
+                            station = decoded.station,
+                            world = decoded.world,
+                            type_name = decoded.type_name(),
+                            type_id = decoded.type_id,
+                            counter = decoded.counter,
+                            global = decoded.global,
+                            private = decoded.private,
+                            players_object = decoded.players_object,
+                            static_object = decoded.static_object,
+                            stored_owner,
+                            packet_sender = client_id,
+                            packet_world = player_world_id,
+                            stored_world,
+                            decision = "rejected_wrong_world",
+                            "object lifecycle"
+                        );
                         Err(UpdateObjectError::WrongWorld(
                             vanject_id,
                             world_id,
@@ -85,6 +109,26 @@ impl OnUpdate_UpdateObject for Server {
                     && vanject.is_non_static()
                     && vanject.player_bind_id != player_bind_id
                 {
+                    warn!(
+                        action = "UPDATE_OBJECT",
+                        id = decoded.id,
+                        id_hex = %format_args!("0x{:08X}", decoded.id as u32),
+                        station = decoded.station,
+                        world = decoded.world,
+                        type_name = decoded.type_name(),
+                        type_id = decoded.type_id,
+                        counter = decoded.counter,
+                        global = decoded.global,
+                        private = decoded.private,
+                        players_object = decoded.players_object,
+                        static_object = decoded.static_object,
+                        stored_owner,
+                        packet_sender = client_id,
+                        packet_world = player_world_id.unwrap_or(255),
+                        stored_world,
+                        decision = "rejected_non_owner",
+                        "object lifecycle"
+                    );
                     Err(UpdateObjectError::NotOwner(vanject_id, player_bind_id))?;
                 }
 
@@ -93,13 +137,57 @@ impl OnUpdate_UpdateObject for Server {
                     .map_err(UpdateObjectError::SliceToVanjectParse)?;
 
                 vanject.player_bind_id = player_bind_id;
+                if decoded.should_log_realtime_update() {
+                    info!(
+                        action = "UPDATE_OBJECT",
+                        id = decoded.id,
+                        id_hex = %format_args!("0x{:08X}", decoded.id as u32),
+                        station = decoded.station,
+                        world = decoded.world,
+                        type_name = decoded.type_name(),
+                        type_id = decoded.type_id,
+                        counter = decoded.counter,
+                        global = decoded.global,
+                        private = decoded.private,
+                        players_object = decoded.players_object,
+                        static_object = decoded.static_object,
+                        stored_owner = player_bind_id,
+                        packet_sender = client_id,
+                        packet_world = player_world_id.unwrap_or(255),
+                        stored_world,
+                        decision = if is_non_global { "accepted_notify_world" } else { "accepted_notify_game" },
+                        "object lifecycle"
+                    );
+                }
                 (
                     Packet::new(Action::UPDATE_OBJECT, &vanject.to_vangers_byte()),
                     is_non_global,
                     world_id,
                 )
             }
-            None => Err(UpdateObjectError::VanjectNotFound(vanject_id))?,
+            None => {
+                warn!(
+                    action = "UPDATE_OBJECT",
+                    id = decoded.id,
+                    id_hex = %format_args!("0x{:08X}", decoded.id as u32),
+                    station = decoded.station,
+                    world = decoded.world,
+                    type_name = decoded.type_name(),
+                    type_id = decoded.type_id,
+                    counter = decoded.counter,
+                    global = decoded.global,
+                    private = decoded.private,
+                    players_object = decoded.players_object,
+                    static_object = decoded.static_object,
+                    stored_owner = -1,
+                    packet_sender = client_id,
+                    packet_world = player_world_id.unwrap_or(255),
+                    stored_world = decoded.world,
+                    decision = "ignored_missing",
+                    "object lifecycle"
+                );
+                Err(UpdateObjectError::VanjectNotFound(vanject_id))?
+            }
         };
 
         let _ = game;
@@ -118,7 +206,7 @@ mod tests {
     use super::*;
     use crate::game::{Game, World};
     use crate::player::Player;
-    use crate::vanject::{Vanject, NID};
+    use crate::vanject::{NID, Vanject};
     use std::cell::RefCell;
     use std::rc::Rc;
 

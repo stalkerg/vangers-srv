@@ -1,13 +1,15 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use ::tracing::info;
+
 use crate::Server;
 use crate::client::ClientID;
 use crate::game::World;
 use crate::player::Status as PlayerStatus;
 use crate::protocol::{Action, Packet};
-use crate::utils::slice_le_to_i16;
-use crate::vanject::NID;
+use crate::utils::{slice_le_to_i16, slice_le_to_i32};
+use crate::vanject::{DecodedVanjectId, NID};
 
 use super::{OnUpdate_LeaveWorld, OnUpdateError, OnUpdateOk};
 
@@ -91,11 +93,14 @@ impl OnUpdate_SetWorld for Server {
             .vanjects
             .iter()
             .filter(|(_, v)| {
-                v.get_type() != NID::VANGER
-                    && v.get_world() == world_id as i32
-                    && !v.is_players()
+                v.get_type() != NID::VANGER && v.get_world() == world_id as i32 && !v.is_players()
             })
-            .map(|(_, v)| Packet::new(Action::UPDATE_OBJECT, &v.to_vangers_byte()))
+            .map(|(_, v)| {
+                (
+                    Packet::new(Action::UPDATE_OBJECT, &v.to_vangers_byte()),
+                    v.player_bind_id,
+                )
+            })
             .collect::<Vec<_>>();
 
         if game.place_player(client_id, &world.borrow()) {
@@ -112,9 +117,33 @@ impl OnUpdate_SetWorld for Server {
         let answer = packet.create_answer(vec![world_id, world_status]).unwrap();
         self.notify_player(client_id, &answer);
 
-        inventories_vanject
-            .iter()
-            .for_each(|p| self.notify_player(client_id, p));
+        inventories_vanject.iter().for_each(|(p, stored_owner)| {
+            if p.data.len() >= 4 {
+                let id = slice_le_to_i32(&p.data[0..4]);
+                let decoded = DecodedVanjectId::new(id);
+                info!(
+                    action = "SET_WORLD replay",
+                    id = decoded.id,
+                    id_hex = %format_args!("0x{:08X}", decoded.id as u32),
+                    station = decoded.station,
+                    world = decoded.world,
+                    type_name = decoded.type_name(),
+                    type_id = decoded.type_id,
+                    counter = decoded.counter,
+                    global = decoded.global,
+                    private = decoded.private,
+                    players_object = decoded.players_object,
+                    static_object = decoded.static_object,
+                    stored_owner = *stored_owner,
+                    packet_sender = client_id,
+                    packet_world = world_id,
+                    stored_world = decoded.world,
+                    decision = "replayed_to_joining_player",
+                    "object lifecycle"
+                );
+            }
+            self.notify_player(client_id, p)
+        });
 
         Ok(OnUpdateOk::Complete)
     }

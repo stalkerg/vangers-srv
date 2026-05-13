@@ -1,8 +1,11 @@
 use std::{cell::BorrowError, collections::HashMap};
 
+use ::tracing::info;
+
 use crate::Server;
 use crate::client::ClientID;
 use crate::protocol::{Action, Packet};
+use crate::vanject::DecodedVanjectId;
 
 use super::{OnUpdateError, OnUpdateOk};
 
@@ -78,6 +81,27 @@ impl OnUpdate_LeaveWorld for Server {
             .iter()
             .filter(|(_, v)| should_delete_on_leave_world(v, player_bind_id))
             .map(|(&id, v)| {
+                let decoded = DecodedVanjectId::new(id);
+                info!(
+                    action = "LEAVE_WORLD auto-delete",
+                    id = decoded.id,
+                    id_hex = %format_args!("0x{:08X}", decoded.id as u32),
+                    station = decoded.station,
+                    world = decoded.world,
+                    type_name = decoded.type_name(),
+                    type_id = decoded.type_id,
+                    counter = decoded.counter,
+                    global = decoded.global,
+                    private = decoded.private,
+                    players_object = decoded.players_object,
+                    static_object = decoded.static_object,
+                    stored_owner = v.player_bind_id,
+                    packet_sender = client_id,
+                    packet_world = world_id,
+                    stored_world = v.get_world(),
+                    decision = "auto_deleted_on_leave_world",
+                    "object lifecycle"
+                );
                 (
                     id,
                     Packet::new(
@@ -92,6 +116,40 @@ impl OnUpdate_LeaveWorld for Server {
                 )
             })
             .collect::<HashMap<_, _>>();
+
+        for (&id, v) in game.vanjects.iter() {
+            let decoded = DecodedVanjectId::new(id);
+            if decoded.station == player_bind_id as i32
+                && v.is_non_global()
+                && v.is_non_static()
+                && !delete.contains_key(&id)
+            {
+                info!(
+                    action = "LEAVE_WORLD preserve",
+                    id = decoded.id,
+                    id_hex = %format_args!("0x{:08X}", decoded.id as u32),
+                    station = decoded.station,
+                    world = decoded.world,
+                    type_name = decoded.type_name(),
+                    type_id = decoded.type_id,
+                    counter = decoded.counter,
+                    global = decoded.global,
+                    private = decoded.private,
+                    players_object = decoded.players_object,
+                    static_object = decoded.static_object,
+                    stored_owner = v.player_bind_id,
+                    packet_sender = client_id,
+                    packet_world = world_id,
+                    stored_world = v.get_world(),
+                    decision = if v.player_bind_id != player_bind_id {
+                        "preserved_transferred_inventory"
+                    } else {
+                        "preserved_world_object"
+                    },
+                    "object lifecycle"
+                );
+            }
+        }
 
         let hide = game
             .vanjects

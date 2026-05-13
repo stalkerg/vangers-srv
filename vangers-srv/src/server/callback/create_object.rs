@@ -1,6 +1,6 @@
 #![allow(clippy::collapsible_else_if)]
 
-use ::tracing::{debug, warn};
+use ::tracing::{debug, info, warn};
 
 use crate::Server;
 use crate::client::ClientID;
@@ -39,6 +39,7 @@ impl OnUpdate_CreateObject for Server {
             Ok(vanject) => vanject,
             Err(err) => return Err(CreateObjectError::SliceToVanjectParse(err).into()),
         };
+        let decoded = DecodedVanjectId::new(vanject.id);
 
         let game = match self.get_mut_game_by_clientid(client_id) {
             Some(game) => game,
@@ -47,8 +48,32 @@ impl OnUpdate_CreateObject for Server {
 
         if let Some(existing) = game.vanjects.get(&vanject.id) {
             debug!("VANJECT with id=`{}` already exists", vanject.id);
+            let existing_decoded = DecodedVanjectId::new(existing.id);
+            info!(
+                action = "CREATE_OBJECT",
+                id = existing_decoded.id,
+                id_hex = %format_args!("0x{:08X}", existing_decoded.id as u32),
+                station = existing_decoded.station,
+                world = existing_decoded.world,
+                type_name = existing_decoded.type_name(),
+                type_id = existing_decoded.type_id,
+                counter = existing_decoded.counter,
+                global = existing_decoded.global,
+                private = existing_decoded.private,
+                players_object = existing_decoded.players_object,
+                static_object = existing_decoded.static_object,
+                stored_owner = existing.player_bind_id,
+                packet_sender = client_id,
+                packet_world = decoded.world,
+                stored_world = existing_decoded.world,
+                decision = "duplicate CREATE_OBJECT replay_existing",
+                "object lifecycle"
+            );
 
-            let mut packets = vec![Packet::new(Action::UPDATE_OBJECT, &existing.to_vangers_byte())];
+            let mut packets = vec![Packet::new(
+                Action::UPDATE_OBJECT,
+                &existing.to_vangers_byte(),
+            )];
             if existing.get_type() == NID::VANGER {
                 let data = std::iter::empty()
                     .chain(&[existing.player_bind_id])
@@ -67,6 +92,27 @@ impl OnUpdate_CreateObject for Server {
             if vanject.bind_to_player(player).is_err() {
                 return Err(CreateObjectError::PlayerNotBind(client_id).into());
             }
+            let player_bind_id = vanject.player_bind_id;
+            info!(
+                action = "CREATE_OBJECT",
+                id = decoded.id,
+                id_hex = %format_args!("0x{:08X}", decoded.id as u32),
+                station = decoded.station,
+                world = decoded.world,
+                type_name = decoded.type_name(),
+                type_id = decoded.type_id,
+                counter = decoded.counter,
+                global = decoded.global,
+                private = decoded.private,
+                players_object = decoded.players_object,
+                static_object = decoded.static_object,
+                stored_owner = player_bind_id,
+                packet_sender = client_id,
+                packet_world = decoded.world,
+                stored_world = decoded.world,
+                decision = "accepted",
+                "object lifecycle"
+            );
 
             if vanject.get_type() == NID::VANGER {
                 player.pos = vanject.pos;

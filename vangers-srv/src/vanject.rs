@@ -74,6 +74,78 @@ pub fn is_non_global_vanject(id: i32) -> bool {
     ((id as u32 >> 16) & 63) != 0u32
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DecodedVanjectId {
+    pub id: i32,
+    pub station: i32,
+    pub world: i32,
+    pub type_id: i32,
+    pub counter: i32,
+    pub global: bool,
+    pub private: bool,
+    pub players_object: bool,
+    pub static_object: bool,
+}
+
+impl DecodedVanjectId {
+    pub fn new(id: i32) -> Self {
+        Self {
+            id,
+            station: get_station(id),
+            world: get_world(id),
+            type_id: (id >> 16) & 63,
+            counter: id & 0xffff,
+            global: !is_non_global_vanject(id),
+            private: is_private_vanject(id),
+            players_object: is_players_vanject(id),
+            static_object: !is_non_static(id),
+        }
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match get_vanject_type(self.id) {
+            NID::GLOBAL => "GLOBAL",
+            NID::DEVICE => "DEVICE",
+            NID::SLOT => "SLOT",
+            NID::SHELL => "SHELL",
+            NID::VANGER => "VANGER",
+            NID::STUFF => "STUFF",
+            NID::SENSOR => "SENSOR",
+            NID::TNT => "TNT",
+            NID::TERRAIN => "TERRAIN",
+            _ => "UNKNOWN",
+        }
+    }
+
+    pub fn should_log_realtime_update(&self) -> bool {
+        self.global
+            || matches!(
+                get_vanject_type(self.id),
+                NID::DEVICE | NID::SLOT | NID::VANGER | NID::STUFF
+            )
+    }
+}
+
+impl fmt::Display for DecodedVanjectId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "id={} id_hex=0x{:08X} station={} world={} type={} type_id={} counter={} global={} private={} players_object={} static={}",
+            self.id,
+            self.id as u32,
+            self.station,
+            self.world,
+            self.type_name(),
+            self.type_id,
+            self.counter,
+            self.global,
+            self.private,
+            self.players_object,
+            self.static_object
+        )
+    }
+}
+
 #[allow(dead_code, non_camel_case_types)]
 pub enum PlayerStatus {
     INITIAL_STATUS = 0,
@@ -448,6 +520,41 @@ mod test {
         assert!(!is_static_world_vanject(shell));
         assert!(!is_static_world_vanject(vanger));
         assert!(!is_static_world_vanject(stuff));
+    }
+
+    #[test]
+    fn decodes_vanject_id_for_diagnostics() {
+        let id = (2 << 26) | (3 << 22) | NID::STUFF | 7;
+        let decoded = DecodedVanjectId::new(id);
+
+        assert_eq!(decoded.id, id);
+        assert_eq!(decoded.station, 2);
+        assert_eq!(decoded.world, 3);
+        assert_eq!(decoded.type_id, 11);
+        assert_eq!(decoded.counter, 7);
+        assert_eq!(decoded.type_name(), "STUFF");
+        assert!(!decoded.global);
+        assert!(!decoded.private);
+        assert!(!decoded.players_object);
+        assert!(!decoded.static_object);
+        assert!(decoded.to_string().contains("station=2"));
+        assert!(decoded.to_string().contains("type=STUFF"));
+    }
+
+    #[test]
+    fn diagnostic_update_logging_filters_noisy_noncritical_types() {
+        let make_id = |nid: i32| (2 << 26) | (3 << 22) | nid | 7;
+
+        assert!(DecodedVanjectId::new(make_id(NID::GLOBAL)).should_log_realtime_update());
+        assert!(DecodedVanjectId::new(make_id(NID::DEVICE)).should_log_realtime_update());
+        assert!(DecodedVanjectId::new(make_id(NID::SLOT)).should_log_realtime_update());
+        assert!(DecodedVanjectId::new(make_id(NID::VANGER)).should_log_realtime_update());
+        assert!(DecodedVanjectId::new(make_id(NID::STUFF)).should_log_realtime_update());
+
+        assert!(!DecodedVanjectId::new(make_id(NID::SHELL)).should_log_realtime_update());
+        assert!(!DecodedVanjectId::new(make_id(NID::SENSOR)).should_log_realtime_update());
+        assert!(!DecodedVanjectId::new(make_id(NID::TNT)).should_log_realtime_update());
+        assert!(!DecodedVanjectId::new(make_id(NID::TERRAIN)).should_log_realtime_update());
     }
 
     mod create_from_slice {

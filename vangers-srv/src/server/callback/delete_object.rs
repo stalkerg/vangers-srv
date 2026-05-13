@@ -1,9 +1,10 @@
-use ::tracing::debug;
+use ::tracing::{debug, info, warn};
 
 use crate::Server;
 use crate::client::ClientID;
 use crate::protocol::{Action, Packet};
 use crate::utils::slice_le_to_i32;
+use crate::vanject::{DecodedVanjectId, get_world, is_non_global_vanject};
 
 use super::{OnUpdateError, OnUpdateOk};
 
@@ -36,6 +37,7 @@ impl OnUpdate_DeleteObject for Server {
         client_id: ClientID,
     ) -> Result<OnUpdateOk, OnUpdateError> {
         let vanject_id = slice_le_to_i32(&packet.data[0..4]);
+        let decoded = DecodedVanjectId::new(vanject_id);
 
         let game = match self.get_mut_game_by_clientid(client_id) {
             Some(game) => game,
@@ -76,23 +78,81 @@ impl OnUpdate_DeleteObject for Server {
 
         match game.vanjects.get(&vanject_id) {
             Some(vanject) if vanject.player_bind_id != player_auth_id => {
+                warn!(
+                    action = "DELETE_OBJECT",
+                    id = decoded.id,
+                    id_hex = %format_args!("0x{:08X}", decoded.id as u32),
+                    station = decoded.station,
+                    world = decoded.world,
+                    type_name = decoded.type_name(),
+                    type_id = decoded.type_id,
+                    counter = decoded.counter,
+                    global = decoded.global,
+                    private = decoded.private,
+                    players_object = decoded.players_object,
+                    static_object = decoded.static_object,
+                    stored_owner = vanject.player_bind_id,
+                    packet_sender = client_id,
+                    packet_world = decoded.world,
+                    stored_world = vanject.get_world(),
+                    decision = "rejected_non_owner",
+                    "object lifecycle"
+                );
                 Err(DeleteObjectError::NotOwner(vanject_id, player_auth_id))?;
             }
-            Some(_) => {}
-            None => debug!("VANJECT with id=`{}` not found", vanject_id),
+            Some(vanject) => {
+                info!(
+                    action = "DELETE_OBJECT",
+                    id = decoded.id,
+                    id_hex = %format_args!("0x{:08X}", decoded.id as u32),
+                    station = decoded.station,
+                    world = decoded.world,
+                    type_name = decoded.type_name(),
+                    type_id = decoded.type_id,
+                    counter = decoded.counter,
+                    global = decoded.global,
+                    private = decoded.private,
+                    players_object = decoded.players_object,
+                    static_object = decoded.static_object,
+                    stored_owner = vanject.player_bind_id,
+                    packet_sender = client_id,
+                    packet_world = decoded.world,
+                    stored_world = vanject.get_world(),
+                    decision = "accepted",
+                    "object lifecycle"
+                );
+            }
+            None => {
+                debug!("VANJECT with id=`{}` not found", vanject_id);
+                warn!(
+                    action = "DELETE_OBJECT",
+                    id = decoded.id,
+                    id_hex = %format_args!("0x{:08X}", decoded.id as u32),
+                    station = decoded.station,
+                    world = decoded.world,
+                    type_name = decoded.type_name(),
+                    type_id = decoded.type_id,
+                    counter = decoded.counter,
+                    global = decoded.global,
+                    private = decoded.private,
+                    players_object = decoded.players_object,
+                    static_object = decoded.static_object,
+                    stored_owner = -1,
+                    packet_sender = client_id,
+                    packet_world = decoded.world,
+                    stored_world = decoded.world,
+                    decision = "ignored_missing",
+                    "object lifecycle"
+                );
+            }
         }
 
         if game.vanjects.remove(&vanject_id).is_none() {
             debug!("VANJECT with id=`{}` not found", vanject_id);
         }
 
-        if crate::vanject::is_non_global_vanject(vanject_id) {
-            self.notify_world(
-                client_id,
-                crate::vanject::get_world(vanject_id) as u8,
-                &answer,
-                false,
-            );
+        if is_non_global_vanject(vanject_id) {
+            self.notify_world(client_id, get_world(vanject_id) as u8, &answer, false);
         } else {
             self.notify_game(client_id, &answer);
         }

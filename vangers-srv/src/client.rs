@@ -1,4 +1,6 @@
 use std::convert::TryFrom;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ::tokio::net::TcpStream;
@@ -39,6 +41,8 @@ pub struct Client {
     pub protocol: u8,
     tx_server: mpsc::Sender<MpscData>,
     tx_client: mpsc::Sender<Vec<u8>>,
+    lossy_drop_last_log_ms: AtomicU64,
+    lossy_drop_suppressed: AtomicU64,
 }
 
 impl Client {
@@ -62,14 +66,16 @@ impl Client {
                 warn!(
                     client_id,
                     action = ?action,
-                    "client outbound queue is full; scheduling reliable packet"
+                    decision = "reliable_fallback_send_spawned",
+                    "client outgoing queue full; reliable fallback send spawned"
                 );
                 ::tokio::spawn(async move {
                     if tx_client.send(data).await.is_err() {
                         warn!(
                             client_id,
                             action = ?action,
-                            "client outbound queue is closed; reliable packet dropped"
+                            decision = "reliable_send_failed",
+                            "client outbound queue is closed; reliable send failed"
                         );
                     }
                 });
@@ -78,7 +84,8 @@ impl Client {
                 warn!(
                     client_id = self.id,
                     action = ?action,
-                    "client outbound queue is closed; reliable packet dropped"
+                    decision = "reliable_send_failed",
+                    "client outbound queue is closed; reliable send failed"
                 );
             }
         }
@@ -90,19 +97,47 @@ impl Client {
         match self.tx_client.try_send(packet.as_bytes()) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
-                warn!(
-                    client_id = self.id,
-                    action = ?action,
-                    "client outbound queue is full; dropping lossy realtime packet"
-                );
+                self.log_lossy_drop(action, "client outgoing queue full");
             }
             Err(TrySendError::Closed(_)) => {
-                warn!(
-                    client_id = self.id,
-                    action = ?action,
-                    "client outbound queue is closed; dropping lossy realtime packet"
-                );
+                self.log_lossy_drop(action, "client outbound queue is closed");
             }
+        }
+    }
+
+    fn log_lossy_drop(&self, action: Action, reason: &'static str) {
+        const LOG_INTERVAL_MS: u64 = 5_000;
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.lossy_drop_last_log_ms.load(Ordering::Relaxed);
+
+        if last != 0 && now_ms.saturating_sub(last) < LOG_INTERVAL_MS {
+            self.lossy_drop_suppressed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        if self
+            .lossy_drop_last_log_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            let suppressed = self.lossy_drop_suppressed.swap(0, Ordering::Relaxed);
+            warn!(
+                client_id = self.id,
+                action = ?action,
+                decision = if action == Action::UPDATE_OBJECT {
+                    "lossy UPDATE_OBJECT dropped"
+                } else {
+                    "lossy SERVER_TIME dropped"
+                },
+                suppressed_drops = suppressed,
+                "{reason}; dropping lossy realtime packet"
+            );
+        } else {
+            self.lossy_drop_suppressed.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -147,10 +182,11 @@ impl Client {
 
             let (mut sr, mut sw) = stream.into_split();
 
+            let writer_peer = peer.clone();
             ::tokio::spawn(async move {
                 while let Some(data) = rx_server.recv().await {
                     if let Err(err) = sw.write_all(&data).await {
-                        error!("client::event_loop: error sending data to client: {err:?}");
+                        error!(peer=%writer_peer, "write_all error: {err:?}");
                         break;
                     }
                 }
@@ -252,6 +288,8 @@ impl Client {
 
         if let Err(err) = stream.set_nodelay(true) {
             warn!(client_id = id, "failed to enable TCP_NODELAY: {err:?}");
+        } else {
+            info!(client_id = id, "TCP_NODELAY enabled");
         }
 
         let client = Self {
@@ -260,6 +298,8 @@ impl Client {
             connection: Connection::Connected,
             tx_server: tx,
             tx_client,
+            lossy_drop_last_log_ms: AtomicU64::new(0),
+            lossy_drop_suppressed: AtomicU64::new(0),
         };
 
         client.event_loop(stream, rx_server);
@@ -360,6 +400,8 @@ mod tests {
                 protocol: 3,
                 tx_server,
                 tx_client,
+                lossy_drop_last_log_ms: AtomicU64::new(0),
+                lossy_drop_suppressed: AtomicU64::new(0),
             },
             rx_client,
         )
