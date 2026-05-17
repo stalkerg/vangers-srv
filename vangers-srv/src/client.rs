@@ -678,24 +678,31 @@ async fn auth(stream: &mut TcpStream) -> Result<u8, AuthError> {
         let protocol_version = received[HS_IN.len() + 1];
 
         if protocol_version != PROTOCOL_VERSION {
+            if let Err(_e) = send_handshake_response(stream, PROTOCOL_VERSION).await {
+                Err(HsResponse)?
+            }
             Err(HsUnexpectedProtocolVersion(
                 &[PROTOCOL_VERSION],
                 protocol_version,
             ))?
         }
 
-        let send = HS_OUT
-            .iter()
-            .chain(&[0u8, protocol_version])
-            .copied()
-            .collect::<Vec<_>>();
-
-        if let Err(_e) = stream.write_all(&send).await {
+        if let Err(_e) = send_handshake_response(stream, protocol_version).await {
             Err(HsResponse)?
         }
 
         return Ok(protocol_version);
     }
+}
+
+async fn send_handshake_response(stream: &mut TcpStream, protocol_version: u8) -> Result<(), ()> {
+    let send = HS_OUT
+        .iter()
+        .chain(&[0u8, protocol_version])
+        .copied()
+        .collect::<Vec<_>>();
+
+    stream.write_all(&send).await.map_err(|_| ())
 }
 
 #[cfg(test)]
