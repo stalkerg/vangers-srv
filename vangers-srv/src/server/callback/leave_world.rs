@@ -163,15 +163,16 @@ impl OnUpdate_LeaveWorld for Server {
             }
         }
 
-        let hide = game
+        let delete_count = delete.len();
+        // The original C++ server clears the leaving player's server-side
+        // visibility/queues, but it does not send HIDE_OBJECT for every object
+        // in the world. The client disables transferring immediately after
+        // LEAVE_WORLD, so such packets become an ignored reliable burst.
+        let skipped_legacy_hide_count = game
             .vanjects
             .iter()
             .filter(|(_, v)| v.is_non_global() && v.get_world() == world_id as i32)
-            .map(|(&id, _)| Packet::new(Action::HIDE_OBJECT, &id.to_le_bytes()))
-            .collect::<Vec<_>>();
-
-        let delete_count = delete.len();
-        let hide_count = hide.len();
+            .count();
 
         info!(
             action = "LEAVE_WORLD summary",
@@ -179,10 +180,11 @@ impl OnUpdate_LeaveWorld for Server {
             player_bind_id,
             world_id,
             delete_objects = delete_count,
-            hide_objects = hide_count,
+            hide_objects = 0usize,
+            skipped_legacy_hide_objects = skipped_legacy_hide_count,
             preserved_objects = preserved_count,
             notify_game_delete_packets = delete_count,
-            notify_player_hide_packets = hide_count,
+            notify_player_hide_packets = 0usize,
             notify_game_players_world_packets = 1u8,
             decision = "world_switch_summary",
             "world switch summary"
@@ -192,10 +194,6 @@ impl OnUpdate_LeaveWorld for Server {
 
         for (_, packet) in delete {
             self.notify_game(client_id, &packet);
-        }
-
-        for packet in hide {
-            self.notify_player(client_id, &packet);
         }
 
         // That sends by github server, but it seems to may be safety removed at all
@@ -374,5 +372,88 @@ mod tests {
         assert!(game.vanjects.contains_key(&sensor_id));
         assert!(game.vanjects.contains_key(&tnt_id));
         assert!(!game.vanjects.contains_key(&slot_id));
+    }
+
+    #[tokio::test]
+    async fn leave_world_does_not_send_world_hide_burst_to_leaving_player() {
+        use crate::client::{Client, Connection, MpscData};
+        use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use ::tokio::net::{TcpListener, TcpStream};
+        use ::tokio::sync::mpsc;
+        use ::tokio::time::{Duration, timeout};
+
+        const HS_IN: &[u8] = b"Vivat Sicher, Rock'n'Roll forever!!!";
+        const HS_OUT: &[u8] = b"Enter, my son, please...";
+        const PROTOCOL_VERSION: u8 = 4;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_connect = ::tokio::spawn(async move { TcpStream::connect(addr).await });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let mut client_stream = client_connect.await.unwrap().unwrap();
+
+        let (tx_server, mut rx_server) = mpsc::channel::<MpscData>(8);
+        let client = Client::new(server_stream, tx_server);
+        let client_id = client.id;
+
+        client_stream.write_all(HS_IN).await.unwrap();
+        client_stream
+            .write_all(&[0, PROTOCOL_VERSION])
+            .await
+            .unwrap();
+
+        let mut handshake = vec![0u8; HS_OUT.len() + 2];
+        client_stream.read_exact(&mut handshake).await.unwrap();
+        assert_eq!(
+            handshake,
+            HS_OUT
+                .iter()
+                .chain(&[0, PROTOCOL_VERSION])
+                .copied()
+                .collect::<Vec<_>>()
+        );
+
+        let auth = timeout(Duration::from_secs(1), rx_server.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match auth {
+            MpscData(id, Connection::Authenticated(protocol)) => {
+                assert_eq!(id, client_id);
+                assert_eq!(protocol, PROTOCOL_VERSION);
+            }
+            _ => panic!("client must authenticate before LEAVE_WORLD test"),
+        }
+
+        let mut srv = Server::new(Default::default());
+        srv.clients.push(client);
+
+        let mut game = Game::new(1);
+        game.attach_player(Player::new(client_id));
+        let world = Rc::new(RefCell::new(World::new(1, 100)));
+        game.worlds.push(Rc::clone(&world));
+        game.place_player(client_id, &world.borrow());
+
+        let station = 1 << 26;
+        let world_bits = 1 << 22;
+        let sensor_id = station | world_bits | NID::SENSOR | 1;
+        let tnt_id = station | world_bits | NID::TNT | 2;
+        game.vanjects.insert(sensor_id, make_vanject(sensor_id, 1));
+        game.vanjects.insert(tnt_id, make_vanject(tnt_id, 1));
+
+        srv.games.insert(1, game);
+        srv.leave_world(&Packet::new(Action::LEAVE_WORLD, &[]), client_id)
+            .unwrap();
+
+        let mut header = [0u8; 2];
+        let read = timeout(
+            Duration::from_millis(150),
+            client_stream.read_exact(&mut header),
+        )
+        .await;
+        assert!(
+            read.is_err(),
+            "LEAVE_WORLD must not send HIDE_OBJECT burst to the leaving client"
+        );
     }
 }
