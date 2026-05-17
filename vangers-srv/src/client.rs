@@ -1,11 +1,15 @@
 use std::convert::TryFrom;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
+use ::tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use ::tokio::net::TcpStream;
-use ::tokio::sync::mpsc::{self, Receiver, error::TrySendError};
-use ::tracing::{error, info, warn};
+use ::tokio::sync::{
+    Notify,
+    mpsc::{self, Receiver, error::TrySendError},
+};
+use ::tracing::{error, info, trace, warn};
 
 use super::protocol::*;
 
@@ -13,6 +17,7 @@ const HS_IN: &[u8] = b"Vivat Sicher, Rock'n'Roll forever!!!";
 const HS_OUT: &[u8] = b"Enter, my son, please...";
 
 pub type ClientID = usize;
+type LatestServerTimeSlot = Arc<Mutex<Option<Vec<u8>>>>;
 
 pub struct MpscData(pub ClientID, pub Connection);
 
@@ -41,16 +46,18 @@ pub struct Client {
     pub protocol: u8,
     tx_server: mpsc::Sender<MpscData>,
     tx_client: mpsc::Sender<Vec<u8>>,
+    latest_server_time: LatestServerTimeSlot,
+    latest_server_time_notify: Arc<Notify>,
     lossy_drop_last_log_ms: AtomicU64,
     lossy_drop_suppressed: AtomicU64,
 }
 
 impl Client {
     pub fn send(&self, packet: &Packet) {
-        if packet.action.is_lossy_realtime() {
-            self.send_lossy(packet);
-        } else {
-            self.send_reliable(packet);
+        match packet.action {
+            Action::SERVER_TIME => self.send_latest_server_time(packet),
+            _ if packet.action.is_lossy_realtime() => self.send_lossy(packet),
+            _ => self.send_reliable(packet),
         }
     }
 
@@ -105,6 +112,19 @@ impl Client {
         }
     }
 
+    fn send_latest_server_time(&self, packet: &Packet) {
+        let replaced = replace_latest_server_time(&self.latest_server_time, packet.as_bytes());
+        if replaced {
+            trace!(
+                client_id = self.id,
+                action = ?packet.action,
+                decision = "server_time_replaced_pending",
+                "replaced pending SERVER_TIME response with a newer one"
+            );
+        }
+        self.latest_server_time_notify.notify_one();
+    }
+
     fn log_lossy_drop(&self, action: Action, reason: &'static str) {
         const LOG_INTERVAL_MS: u64 = 5_000;
 
@@ -141,8 +161,10 @@ impl Client {
         }
     }
 
-    fn event_loop(&self, mut stream: TcpStream, mut rx_server: Receiver<Vec<u8>>) {
+    fn event_loop(&self, mut stream: TcpStream, rx_server: Receiver<Vec<u8>>) {
         let tx_server = self.tx_server.clone();
+        let latest_server_time = Arc::clone(&self.latest_server_time);
+        let latest_server_time_notify = Arc::clone(&self.latest_server_time_notify);
         let id = self.id;
         let peer = stream
             .peer_addr()
@@ -180,17 +202,16 @@ impl Client {
                 return;
             }
 
-            let (mut sr, mut sw) = stream.into_split();
+            let (mut sr, sw) = stream.into_split();
 
             let writer_peer = peer.clone();
-            ::tokio::spawn(async move {
-                while let Some(data) = rx_server.recv().await {
-                    if let Err(err) = sw.write_all(&data).await {
-                        error!(peer=%writer_peer, "write_all error: {err:?}");
-                        break;
-                    }
-                }
-            });
+            ::tokio::spawn(writer_loop(
+                sw,
+                rx_server,
+                latest_server_time,
+                latest_server_time_notify,
+                writer_peer,
+            ));
 
             let mut buff = [0u8; i16::MAX as usize];
             let mut buff_offset: usize = 0;
@@ -285,6 +306,8 @@ impl Client {
     pub fn new(stream: TcpStream, tx: mpsc::Sender<MpscData>) -> Self {
         let id = ::rand::random();
         let (tx_client, rx_server) = mpsc::channel::<Vec<u8>>(1000);
+        let latest_server_time = Arc::new(Mutex::new(None));
+        let latest_server_time_notify = Arc::new(Notify::new());
 
         if let Err(err) = stream.set_nodelay(true) {
             warn!(client_id = id, "failed to enable TCP_NODELAY: {err:?}");
@@ -298,6 +321,8 @@ impl Client {
             connection: Connection::Connected,
             tx_server: tx,
             tx_client,
+            latest_server_time,
+            latest_server_time_notify,
             lossy_drop_last_log_ms: AtomicU64::new(0),
             lossy_drop_suppressed: AtomicU64::new(0),
         };
@@ -305,6 +330,64 @@ impl Client {
         client.event_loop(stream, rx_server);
         client
     }
+}
+
+fn replace_latest_server_time(slot: &LatestServerTimeSlot, data: Vec<u8>) -> bool {
+    let mut pending = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.replace(data).is_some()
+}
+
+fn take_latest_server_time(slot: &LatestServerTimeSlot) -> Option<Vec<u8>> {
+    let mut pending = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.take()
+}
+
+async fn writer_loop<W>(
+    mut sw: W,
+    mut rx_server: Receiver<Vec<u8>>,
+    latest_server_time: LatestServerTimeSlot,
+    latest_server_time_notify: Arc<Notify>,
+    peer: String,
+) where
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        if let Some(data) = take_latest_server_time(&latest_server_time) {
+            if !write_client_packet(&mut sw, &data, &peer).await {
+                break;
+            }
+            continue;
+        }
+
+        ::tokio::select! {
+            biased;
+            _ = latest_server_time_notify.notified() => {
+                continue;
+            }
+            data = rx_server.recv() => {
+                match data {
+                    Some(data) => {
+                        if !write_client_packet(&mut sw, &data, &peer).await {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+async fn write_client_packet<W>(sw: &mut W, data: &[u8], peer: &str) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Err(err) = sw.write_all(data).await {
+        error!(peer=%peer, "write_all error: {err:?}");
+        return false;
+    }
+
+    true
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -383,8 +466,10 @@ async fn auth(stream: &mut TcpStream) -> Result<u8, AuthError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use ::tokio::io::{AsyncRead, AsyncReadExt, duplex};
     use ::tokio::sync::mpsc;
 
     use super::*;
@@ -400,11 +485,28 @@ mod tests {
                 protocol: 3,
                 tx_server,
                 tx_client,
+                latest_server_time: Arc::new(Mutex::new(None)),
+                latest_server_time_notify: Arc::new(Notify::new()),
                 lossy_drop_last_log_ms: AtomicU64::new(0),
                 lossy_drop_suppressed: AtomicU64::new(0),
             },
             rx_client,
         )
+    }
+
+    async fn read_packet<R>(reader: &mut R) -> Vec<u8>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut header = [0u8; 2];
+        reader.read_exact(&mut header).await.unwrap();
+        let body_size = ((header[0] as i16) | ((header[1] as i16) << 8)) as usize;
+        let mut body = vec![0u8; body_size];
+        reader.read_exact(&mut body).await.unwrap();
+
+        let mut packet = header.to_vec();
+        packet.extend_from_slice(&body);
+        packet
     }
 
     #[test]
@@ -418,6 +520,38 @@ mod tests {
 
         assert_eq!(rx_client.try_recv().unwrap(), first.as_bytes());
         assert!(rx_client.try_recv().is_err());
+    }
+
+    #[test]
+    fn server_time_uses_latest_slot_instead_of_fifo_queue() {
+        let (client, mut rx_client) = test_client(10);
+        let packet = Packet::new(Action::SERVER_TIME, &[1, 2, 3, 4]);
+
+        client.send(&packet);
+
+        assert!(rx_client.try_recv().is_err());
+        assert_eq!(
+            take_latest_server_time(&client.latest_server_time).unwrap(),
+            packet.as_bytes()
+        );
+        assert!(take_latest_server_time(&client.latest_server_time).is_none());
+    }
+
+    #[test]
+    fn newer_server_time_replaces_pending_server_time() {
+        let (client, mut rx_client) = test_client(10);
+        let old = Packet::new(Action::SERVER_TIME, &[1, 0, 0, 0]);
+        let new = Packet::new(Action::SERVER_TIME, &[2, 0, 0, 0]);
+
+        client.send(&old);
+        client.send(&new);
+
+        assert!(rx_client.try_recv().is_err());
+        assert_eq!(
+            take_latest_server_time(&client.latest_server_time).unwrap(),
+            new.as_bytes()
+        );
+        assert!(take_latest_server_time(&client.latest_server_time).is_none());
     }
 
     #[tokio::test]
@@ -436,5 +570,59 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(second_bytes, second.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn writer_sends_pending_server_time_before_fifo_packets() {
+        let (tx_client, rx_server) = mpsc::channel::<Vec<u8>>(10);
+        let latest_server_time = Arc::new(Mutex::new(None));
+        let latest_server_time_notify = Arc::new(Notify::new());
+
+        let fifo = Packet::new(Action::PLAYERS_DATA, &[1]);
+        let server_time = Packet::new(Action::SERVER_TIME, &[2, 0, 0, 0]);
+        tx_client.try_send(fifo.as_bytes()).unwrap();
+        replace_latest_server_time(&latest_server_time, server_time.as_bytes());
+
+        let (mut reader, writer) = duplex(1024);
+        let writer_task = ::tokio::spawn(writer_loop(
+            writer,
+            rx_server,
+            Arc::clone(&latest_server_time),
+            Arc::clone(&latest_server_time_notify),
+            "test-peer".to_string(),
+        ));
+
+        assert_eq!(read_packet(&mut reader).await, server_time.as_bytes());
+        assert_eq!(read_packet(&mut reader).await, fifo.as_bytes());
+
+        drop(tx_client);
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn writer_observes_server_time_notify_without_fifo_activity() {
+        let (_tx_client, rx_server) = mpsc::channel::<Vec<u8>>(10);
+        let latest_server_time = Arc::new(Mutex::new(None));
+        let latest_server_time_notify = Arc::new(Notify::new());
+
+        let (mut reader, writer) = duplex(1024);
+        let writer_task = ::tokio::spawn(writer_loop(
+            writer,
+            rx_server,
+            Arc::clone(&latest_server_time),
+            Arc::clone(&latest_server_time_notify),
+            "test-peer".to_string(),
+        ));
+
+        let server_time = Packet::new(Action::SERVER_TIME, &[3, 0, 0, 0]);
+        replace_latest_server_time(&latest_server_time, server_time.as_bytes());
+        latest_server_time_notify.notify_one();
+
+        let packet = ::tokio::time::timeout(Duration::from_secs(1), read_packet(&mut reader))
+            .await
+            .unwrap();
+        assert_eq!(packet, server_time.as_bytes());
+
+        writer_task.abort();
     }
 }
