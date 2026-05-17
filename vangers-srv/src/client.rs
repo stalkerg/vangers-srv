@@ -643,7 +643,7 @@ enum AuthError {
 async fn auth(stream: &mut TcpStream) -> Result<u8, AuthError> {
     use AuthError::*;
 
-    const PROTOCOL_VERSION: u8 = 3;
+    const PROTOCOL_VERSION: u8 = 4;
     const HS_TOTAL_LEN: usize = HS_IN.len() + 2; // magic + '\0' + version
 
     let mut received = Vec::with_capacity(HS_TOTAL_LEN);
@@ -717,7 +717,7 @@ mod tests {
             Client {
                 id: 1,
                 connection: Connection::Connected,
-                protocol: 3,
+                protocol: 4,
                 tx_server,
                 tx_client,
                 latest_server_time: Arc::new(Mutex::new(None)),
