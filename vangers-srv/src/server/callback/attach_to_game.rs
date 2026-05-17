@@ -106,16 +106,10 @@ impl OnUpdate_AttachToGame for Server {
             self.notify_player(client_id, &packet);
         }
 
-        if self
-            .clients
-            .iter()
-            .any(|c| c.id == client_id && c.protocol > 1)
-        {
-            let now = std::time::SystemTime::now();
-            let unix = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
-            let packet = Packet::new(Action::Z_TIME_RESPONSE, &unix.to_le_bytes());
-            self.notify_player(client_id, &packet);
-        }
+        let now = std::time::SystemTime::now();
+        let unix = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+        let packet = Packet::new(Action::Z_TIME_RESPONSE, &unix.to_le_bytes());
+        self.notify_player(client_id, &packet);
 
         packets
             .iter()
