@@ -145,6 +145,20 @@ impl OnUpdate_SetWorld for Server {
             self.notify_player(client_id, p)
         });
 
+        info!(
+            action = "SET_WORLD summary",
+            packet_sender = client_id,
+            player_bind_id,
+            requested_world = world_id,
+            world_status,
+            left_previous_world = needs_leave_world,
+            replayed_inventory_objects = inventories_vanject.len(),
+            notify_game_players_world_packets = 1u8,
+            notify_player_set_world_response_packets = 1u8,
+            decision = "world_switch_summary",
+            "world switch summary"
+        );
+
         Ok(OnUpdateOk::Complete)
     }
 }

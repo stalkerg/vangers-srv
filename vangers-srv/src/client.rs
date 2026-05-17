@@ -18,6 +18,7 @@ const HS_OUT: &[u8] = b"Enter, my son, please...";
 pub type ClientID = usize;
 type LatestServerTimeSlot = Arc<Mutex<Option<Vec<u8>>>>;
 type LatestObjectUpdatesSlot = Arc<Mutex<LatestObjectUpdates>>;
+type ClientNetworkStatsSlot = Arc<Mutex<ClientNetworkStats>>;
 
 pub struct MpscData(pub ClientID, pub Connection);
 
@@ -50,6 +51,7 @@ pub struct Client {
     latest_server_time_notify: Arc<Notify>,
     latest_object_updates: LatestObjectUpdatesSlot,
     latest_object_updates_notify: Arc<Notify>,
+    network_stats: ClientNetworkStatsSlot,
 }
 
 impl Client {
@@ -66,6 +68,9 @@ impl Client {
             if let Some(object_id) = packet_object_id(packet) {
                 let removed = remove_latest_object_update(&self.latest_object_updates, object_id);
                 if removed {
+                    record_network_stats(&self.network_stats, |stats| {
+                        stats.realtime_updates_dropped_by_lifecycle += 1;
+                    });
                     trace!(
                         client_id = self.id,
                         action = ?action,
@@ -81,9 +86,14 @@ impl Client {
         let data = packet.as_bytes();
 
         match self.tx_client.try_send(data) {
-            Ok(()) => {}
+            Ok(()) => {
+                record_network_stats(&self.network_stats, |stats| {
+                    stats.reliable_queued += 1;
+                });
+            }
             Err(TrySendError::Full(data)) => {
                 let tx_client = self.tx_client.clone();
+                let network_stats = Arc::clone(&self.network_stats);
                 let client_id = self.id;
                 warn!(
                     client_id,
@@ -91,8 +101,14 @@ impl Client {
                     decision = "reliable_fallback_send_spawned",
                     "client outgoing queue full; reliable fallback send spawned"
                 );
+                record_network_stats(&self.network_stats, |stats| {
+                    stats.reliable_fallback_spawned += 1;
+                });
                 ::tokio::spawn(async move {
                     if tx_client.send(data).await.is_err() {
+                        record_network_stats(&network_stats, |stats| {
+                            stats.reliable_send_failed += 1;
+                        });
                         warn!(
                             client_id,
                             action = ?action,
@@ -103,6 +119,9 @@ impl Client {
                 });
             }
             Err(TrySendError::Closed(_)) => {
+                record_network_stats(&self.network_stats, |stats| {
+                    stats.reliable_send_failed += 1;
+                });
                 warn!(
                     client_id = self.id,
                     action = ?action,
@@ -126,6 +145,12 @@ impl Client {
                     object_id,
                     packet.as_bytes(),
                 );
+                record_network_stats(&self.network_stats, |stats| {
+                    stats.realtime_updates_pending += 1;
+                    if replaced {
+                        stats.realtime_updates_replaced += 1;
+                    }
+                });
                 if replaced {
                     trace!(
                         client_id = self.id,
@@ -139,6 +164,9 @@ impl Client {
                 self.latest_object_updates_notify.notify_one();
             }
             None => {
+                record_network_stats(&self.network_stats, |stats| {
+                    stats.malformed_realtime_update_fallbacks += 1;
+                });
                 warn!(
                     client_id = self.id,
                     action = ?packet.action,
@@ -152,6 +180,12 @@ impl Client {
 
     fn send_latest_server_time(&self, packet: &Packet) {
         let replaced = replace_latest_server_time(&self.latest_server_time, packet.as_bytes());
+        record_network_stats(&self.network_stats, |stats| {
+            stats.server_time_pending += 1;
+            if replaced {
+                stats.server_time_replaced += 1;
+            }
+        });
         if replaced {
             trace!(
                 client_id = self.id,
@@ -169,6 +203,7 @@ impl Client {
         let latest_server_time_notify = Arc::clone(&self.latest_server_time_notify);
         let latest_object_updates = Arc::clone(&self.latest_object_updates);
         let latest_object_updates_notify = Arc::clone(&self.latest_object_updates_notify);
+        let network_stats = Arc::clone(&self.network_stats);
         let id = self.id;
         let peer = stream
             .peer_addr()
@@ -216,6 +251,8 @@ impl Client {
                 latest_server_time_notify,
                 latest_object_updates,
                 latest_object_updates_notify,
+                network_stats,
+                id,
                 writer_peer,
             ));
 
@@ -316,6 +353,7 @@ impl Client {
         let latest_server_time_notify = Arc::new(Notify::new());
         let latest_object_updates = Arc::new(Mutex::new(LatestObjectUpdates::default()));
         let latest_object_updates_notify = Arc::new(Notify::new());
+        let network_stats = Arc::new(Mutex::new(ClientNetworkStats::default()));
 
         if let Err(err) = stream.set_nodelay(true) {
             warn!(client_id = id, "failed to enable TCP_NODELAY: {err:?}");
@@ -333,6 +371,7 @@ impl Client {
             latest_server_time_notify,
             latest_object_updates,
             latest_object_updates_notify,
+            network_stats,
         };
 
         client.event_loop(stream, rx_server);
@@ -412,6 +451,78 @@ fn packet_object_id(packet: &Packet) -> Option<i32> {
     Some(i32::from_le_bytes([id[0], id[1], id[2], id[3]]))
 }
 
+#[derive(Default, Debug, Clone)]
+struct ClientNetworkStats {
+    reliable_queued: u64,
+    reliable_fallback_spawned: u64,
+    reliable_send_failed: u64,
+    server_time_pending: u64,
+    server_time_replaced: u64,
+    realtime_updates_pending: u64,
+    realtime_updates_replaced: u64,
+    realtime_updates_dropped_by_lifecycle: u64,
+    malformed_realtime_update_fallbacks: u64,
+    packets_written: u64,
+    bytes_written: u64,
+    write_errors: u64,
+}
+
+impl ClientNetworkStats {
+    fn has_activity(&self) -> bool {
+        self.reliable_queued != 0
+            || self.reliable_fallback_spawned != 0
+            || self.reliable_send_failed != 0
+            || self.server_time_pending != 0
+            || self.server_time_replaced != 0
+            || self.realtime_updates_pending != 0
+            || self.realtime_updates_replaced != 0
+            || self.realtime_updates_dropped_by_lifecycle != 0
+            || self.malformed_realtime_update_fallbacks != 0
+            || self.packets_written != 0
+            || self.bytes_written != 0
+            || self.write_errors != 0
+    }
+}
+
+fn record_network_stats<F>(slot: &ClientNetworkStatsSlot, update: F)
+where
+    F: FnOnce(&mut ClientNetworkStats),
+{
+    let mut stats = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    update(&mut stats);
+}
+
+fn network_stats_snapshot(slot: &ClientNetworkStatsSlot) -> ClientNetworkStats {
+    slot.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn log_client_network_summary(client_id: ClientID, peer: &str, stats: &ClientNetworkStats) {
+    if !stats.has_activity() {
+        return;
+    }
+
+    info!(
+        client_id,
+        peer = %peer,
+        reliable_queued = stats.reliable_queued,
+        reliable_fallback_spawned = stats.reliable_fallback_spawned,
+        reliable_send_failed = stats.reliable_send_failed,
+        server_time_pending = stats.server_time_pending,
+        server_time_replaced = stats.server_time_replaced,
+        realtime_updates_pending = stats.realtime_updates_pending,
+        realtime_updates_replaced = stats.realtime_updates_replaced,
+        realtime_updates_dropped_by_lifecycle = stats.realtime_updates_dropped_by_lifecycle,
+        malformed_realtime_update_fallbacks = stats.malformed_realtime_update_fallbacks,
+        packets_written = stats.packets_written,
+        bytes_written = stats.bytes_written,
+        write_errors = stats.write_errors,
+        decision = "client_network_summary",
+        "client network summary"
+    );
+}
+
 async fn writer_loop<W>(
     mut sw: W,
     mut rx_server: Receiver<Vec<u8>>,
@@ -419,6 +530,8 @@ async fn writer_loop<W>(
     latest_server_time_notify: Arc<Notify>,
     latest_object_updates: LatestObjectUpdatesSlot,
     latest_object_updates_notify: Arc<Notify>,
+    network_stats: ClientNetworkStatsSlot,
+    client_id: ClientID,
     peer: String,
 ) where
     W: AsyncWrite + Unpin,
@@ -427,7 +540,7 @@ async fn writer_loop<W>(
 
     loop {
         if let Some(data) = take_latest_server_time(&latest_server_time) {
-            if !write_client_packet(&mut sw, &data, &peer).await {
+            if !write_client_packet(&mut sw, &data, &peer, &network_stats).await {
                 break;
             }
             continue;
@@ -436,7 +549,7 @@ async fn writer_loop<W>(
         if !rx_server_closed {
             match rx_server.try_recv() {
                 Ok(data) => {
-                    if !write_client_packet(&mut sw, &data, &peer).await {
+                    if !write_client_packet(&mut sw, &data, &peer, &network_stats).await {
                         break;
                     }
                     continue;
@@ -449,7 +562,7 @@ async fn writer_loop<W>(
         }
 
         if let Some(data) = take_next_latest_object_update(&latest_object_updates) {
-            if !write_client_packet(&mut sw, &data, &peer).await {
+            if !write_client_packet(&mut sw, &data, &peer, &network_stats).await {
                 break;
             }
             continue;
@@ -467,7 +580,7 @@ async fn writer_loop<W>(
             data = rx_server.recv() => {
                 match data {
                     Some(data) => {
-                        if !write_client_packet(&mut sw, &data, &peer).await {
+                        if !write_client_packet(&mut sw, &data, &peer, &network_stats).await {
                             break;
                         }
                     }
@@ -481,16 +594,32 @@ async fn writer_loop<W>(
             }
         }
     }
+
+    let stats = network_stats_snapshot(&network_stats);
+    log_client_network_summary(client_id, &peer, &stats);
 }
 
-async fn write_client_packet<W>(sw: &mut W, data: &[u8], peer: &str) -> bool
+async fn write_client_packet<W>(
+    sw: &mut W,
+    data: &[u8],
+    peer: &str,
+    network_stats: &ClientNetworkStatsSlot,
+) -> bool
 where
     W: AsyncWrite + Unpin,
 {
     if let Err(err) = sw.write_all(data).await {
+        record_network_stats(network_stats, |stats| {
+            stats.write_errors += 1;
+        });
         error!(peer=%peer, "write_all error: {err:?}");
         return false;
     }
+
+    record_network_stats(network_stats, |stats| {
+        stats.packets_written += 1;
+        stats.bytes_written += data.len() as u64;
+    });
 
     true
 }
@@ -595,6 +724,7 @@ mod tests {
                 latest_server_time_notify: Arc::new(Notify::new()),
                 latest_object_updates: Arc::new(Mutex::new(LatestObjectUpdates::default())),
                 latest_object_updates_notify: Arc::new(Notify::new()),
+                network_stats: Arc::new(Mutex::new(ClientNetworkStats::default())),
             },
             rx_client,
         )
@@ -684,6 +814,22 @@ mod tests {
     }
 
     #[test]
+    fn realtime_stats_count_pending_and_replaced_updates() {
+        let (client, mut rx_client) = test_client(10);
+        let old = make_update_packet(1, 10);
+        let new = make_update_packet(1, 20);
+
+        client.send_realtime_update(&old);
+        client.send_realtime_update(&new);
+
+        assert!(rx_client.try_recv().is_err());
+        let stats = network_stats_snapshot(&client.network_stats);
+        assert_eq!(stats.realtime_updates_pending, 2);
+        assert_eq!(stats.realtime_updates_replaced, 1);
+        assert!(stats.has_activity());
+    }
+
+    #[test]
     fn different_realtime_objects_are_kept_independently() {
         let (client, mut rx_client) = test_client(10);
         let first = make_update_packet(1, 10);
@@ -749,6 +895,8 @@ mod tests {
 
         assert_eq!(rx_client.try_recv().unwrap(), delete.as_bytes());
         assert!(take_next_latest_object_update(&client.latest_object_updates).is_none());
+        let stats = network_stats_snapshot(&client.network_stats);
+        assert_eq!(stats.realtime_updates_dropped_by_lifecycle, 1);
     }
 
     #[test]
@@ -843,6 +991,17 @@ mod tests {
             new.as_bytes()
         );
         assert!(take_latest_server_time(&client.latest_server_time).is_none());
+        let stats = network_stats_snapshot(&client.network_stats);
+        assert_eq!(stats.server_time_pending, 2);
+        assert_eq!(stats.server_time_replaced, 1);
+        assert!(stats.has_activity());
+    }
+
+    #[test]
+    fn empty_network_stats_do_not_emit_summary_activity() {
+        let stats = ClientNetworkStats::default();
+
+        assert!(!stats.has_activity());
     }
 
     #[tokio::test]
@@ -870,6 +1029,7 @@ mod tests {
         let latest_server_time_notify = Arc::new(Notify::new());
         let latest_object_updates = Arc::new(Mutex::new(LatestObjectUpdates::default()));
         let latest_object_updates_notify = Arc::new(Notify::new());
+        let network_stats = Arc::new(Mutex::new(ClientNetworkStats::default()));
 
         let fifo = Packet::new(Action::PLAYERS_DATA, &[1]);
         let server_time = Packet::new(Action::SERVER_TIME, &[2, 0, 0, 0]);
@@ -884,11 +1044,19 @@ mod tests {
             Arc::clone(&latest_server_time_notify),
             Arc::clone(&latest_object_updates),
             Arc::clone(&latest_object_updates_notify),
+            Arc::clone(&network_stats),
+            1,
             "test-peer".to_string(),
         ));
 
         assert_eq!(read_packet(&mut reader).await, server_time.as_bytes());
         assert_eq!(read_packet(&mut reader).await, fifo.as_bytes());
+        let stats = network_stats_snapshot(&network_stats);
+        assert_eq!(stats.packets_written, 2);
+        assert_eq!(
+            stats.bytes_written,
+            (server_time.as_bytes().len() + fifo.as_bytes().len()) as u64
+        );
 
         drop(tx_client);
         writer_task.abort();
@@ -901,6 +1069,7 @@ mod tests {
         let latest_server_time_notify = Arc::new(Notify::new());
         let latest_object_updates = Arc::new(Mutex::new(LatestObjectUpdates::default()));
         let latest_object_updates_notify = Arc::new(Notify::new());
+        let network_stats = Arc::new(Mutex::new(ClientNetworkStats::default()));
 
         let (mut reader, writer) = duplex(1024);
         let writer_task = ::tokio::spawn(writer_loop(
@@ -910,6 +1079,8 @@ mod tests {
             Arc::clone(&latest_server_time_notify),
             Arc::clone(&latest_object_updates),
             Arc::clone(&latest_object_updates_notify),
+            Arc::clone(&network_stats),
+            1,
             "test-peer".to_string(),
         ));
 
@@ -932,6 +1103,7 @@ mod tests {
         let latest_server_time_notify = Arc::new(Notify::new());
         let latest_object_updates = Arc::new(Mutex::new(LatestObjectUpdates::default()));
         let latest_object_updates_notify = Arc::new(Notify::new());
+        let network_stats = Arc::new(Mutex::new(ClientNetworkStats::default()));
 
         let fifo = Packet::new(Action::PLAYERS_DATA, &[1]);
         let update = make_update_packet(1, 10);
@@ -946,6 +1118,8 @@ mod tests {
             Arc::clone(&latest_server_time_notify),
             Arc::clone(&latest_object_updates),
             Arc::clone(&latest_object_updates_notify),
+            Arc::clone(&network_stats),
+            1,
             "test-peer".to_string(),
         ));
 
@@ -963,6 +1137,7 @@ mod tests {
         let latest_server_time_notify = Arc::new(Notify::new());
         let latest_object_updates = Arc::new(Mutex::new(LatestObjectUpdates::default()));
         let latest_object_updates_notify = Arc::new(Notify::new());
+        let network_stats = Arc::new(Mutex::new(ClientNetworkStats::default()));
 
         let (mut reader, writer) = duplex(1024);
         let writer_task = ::tokio::spawn(writer_loop(
@@ -972,6 +1147,8 @@ mod tests {
             Arc::clone(&latest_server_time_notify),
             Arc::clone(&latest_object_updates),
             Arc::clone(&latest_object_updates_notify),
+            Arc::clone(&network_stats),
+            1,
             "test-peer".to_string(),
         ));
 

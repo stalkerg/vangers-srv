@@ -117,6 +117,18 @@ impl OnUpdate_LeaveWorld for Server {
             })
             .collect::<HashMap<_, _>>();
 
+        let preserved_count = game
+            .vanjects
+            .iter()
+            .filter(|(id, v)| {
+                let decoded = DecodedVanjectId::new(**id);
+                decoded.station == player_bind_id as i32
+                    && v.is_non_global()
+                    && v.is_non_static()
+                    && !delete.contains_key(id)
+            })
+            .count();
+
         for (&id, v) in game.vanjects.iter() {
             let decoded = DecodedVanjectId::new(id);
             if decoded.station == player_bind_id as i32
@@ -157,6 +169,24 @@ impl OnUpdate_LeaveWorld for Server {
             .filter(|(_, v)| v.is_non_global() && v.get_world() == world_id as i32)
             .map(|(&id, _)| Packet::new(Action::HIDE_OBJECT, &id.to_le_bytes()))
             .collect::<Vec<_>>();
+
+        let delete_count = delete.len();
+        let hide_count = hide.len();
+
+        info!(
+            action = "LEAVE_WORLD summary",
+            packet_sender = client_id,
+            player_bind_id,
+            world_id,
+            delete_objects = delete_count,
+            hide_objects = hide_count,
+            preserved_objects = preserved_count,
+            notify_game_delete_packets = delete_count,
+            notify_player_hide_packets = hide_count,
+            notify_game_players_world_packets = 1u8,
+            decision = "world_switch_summary",
+            "world switch summary"
+        );
 
         game.vanjects.retain(|id, _| !delete.contains_key(id));
 
