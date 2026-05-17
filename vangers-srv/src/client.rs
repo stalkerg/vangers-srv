@@ -1,7 +1,6 @@
+use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use ::tokio::net::TcpStream;
@@ -18,6 +17,7 @@ const HS_OUT: &[u8] = b"Enter, my son, please...";
 
 pub type ClientID = usize;
 type LatestServerTimeSlot = Arc<Mutex<Option<Vec<u8>>>>;
+type LatestObjectUpdatesSlot = Arc<Mutex<LatestObjectUpdates>>;
 
 pub struct MpscData(pub ClientID, pub Connection);
 
@@ -48,21 +48,36 @@ pub struct Client {
     tx_client: mpsc::Sender<Vec<u8>>,
     latest_server_time: LatestServerTimeSlot,
     latest_server_time_notify: Arc<Notify>,
-    lossy_drop_last_log_ms: AtomicU64,
-    lossy_drop_suppressed: AtomicU64,
+    latest_object_updates: LatestObjectUpdatesSlot,
+    latest_object_updates_notify: Arc<Notify>,
 }
 
 impl Client {
     pub fn send(&self, packet: &Packet) {
         match packet.action {
             Action::SERVER_TIME => self.send_latest_server_time(packet),
-            _ if packet.action.is_lossy_realtime() => self.send_lossy(packet),
             _ => self.send_reliable(packet),
         }
     }
 
     pub fn send_reliable(&self, packet: &Packet) {
         let action = packet.action;
+        if matches!(action, Action::DELETE_OBJECT | Action::HIDE_OBJECT) {
+            if let Some(object_id) = packet_object_id(packet) {
+                let removed = remove_latest_object_update(&self.latest_object_updates, object_id);
+                if removed {
+                    trace!(
+                        client_id = self.id,
+                        action = ?action,
+                        object_id,
+                        object_id_hex = %format_args!("0x{:08X}", object_id as u32),
+                        decision = "dropped_pending_realtime_update",
+                        "dropped pending realtime UPDATE_OBJECT before lifecycle packet"
+                    );
+                }
+            }
+        }
+
         let data = packet.as_bytes();
 
         match self.tx_client.try_send(data) {
@@ -98,16 +113,39 @@ impl Client {
         }
     }
 
-    pub fn send_lossy(&self, packet: &Packet) {
-        let action = packet.action;
+    pub fn send_realtime_update(&self, packet: &Packet) {
+        if packet.action != Action::UPDATE_OBJECT {
+            self.send(packet);
+            return;
+        }
 
-        match self.tx_client.try_send(packet.as_bytes()) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.log_lossy_drop(action, "client outgoing queue full");
+        match packet_object_id(packet) {
+            Some(object_id) => {
+                let replaced = replace_latest_object_update(
+                    &self.latest_object_updates,
+                    object_id,
+                    packet.as_bytes(),
+                );
+                if replaced {
+                    trace!(
+                        client_id = self.id,
+                        action = ?packet.action,
+                        object_id,
+                        object_id_hex = %format_args!("0x{:08X}", object_id as u32),
+                        decision = "realtime_update_replaced_pending",
+                        "replaced pending realtime UPDATE_OBJECT with a newer one"
+                    );
+                }
+                self.latest_object_updates_notify.notify_one();
             }
-            Err(TrySendError::Closed(_)) => {
-                self.log_lossy_drop(action, "client outbound queue is closed");
+            None => {
+                warn!(
+                    client_id = self.id,
+                    action = ?packet.action,
+                    decision = "malformed_realtime_update_fallback_reliable",
+                    "UPDATE_OBJECT without object id; sending through reliable queue"
+                );
+                self.send_reliable(packet);
             }
         }
     }
@@ -125,46 +163,12 @@ impl Client {
         self.latest_server_time_notify.notify_one();
     }
 
-    fn log_lossy_drop(&self, action: Action, reason: &'static str) {
-        const LOG_INTERVAL_MS: u64 = 5_000;
-
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
-        let last = self.lossy_drop_last_log_ms.load(Ordering::Relaxed);
-
-        if last != 0 && now_ms.saturating_sub(last) < LOG_INTERVAL_MS {
-            self.lossy_drop_suppressed.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-
-        if self
-            .lossy_drop_last_log_ms
-            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            let suppressed = self.lossy_drop_suppressed.swap(0, Ordering::Relaxed);
-            warn!(
-                client_id = self.id,
-                action = ?action,
-                decision = if action == Action::UPDATE_OBJECT {
-                    "lossy UPDATE_OBJECT dropped"
-                } else {
-                    "lossy SERVER_TIME dropped"
-                },
-                suppressed_drops = suppressed,
-                "{reason}; dropping lossy realtime packet"
-            );
-        } else {
-            self.lossy_drop_suppressed.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     fn event_loop(&self, mut stream: TcpStream, rx_server: Receiver<Vec<u8>>) {
         let tx_server = self.tx_server.clone();
         let latest_server_time = Arc::clone(&self.latest_server_time);
         let latest_server_time_notify = Arc::clone(&self.latest_server_time_notify);
+        let latest_object_updates = Arc::clone(&self.latest_object_updates);
+        let latest_object_updates_notify = Arc::clone(&self.latest_object_updates_notify);
         let id = self.id;
         let peer = stream
             .peer_addr()
@@ -210,6 +214,8 @@ impl Client {
                 rx_server,
                 latest_server_time,
                 latest_server_time_notify,
+                latest_object_updates,
+                latest_object_updates_notify,
                 writer_peer,
             ));
 
@@ -308,6 +314,8 @@ impl Client {
         let (tx_client, rx_server) = mpsc::channel::<Vec<u8>>(1000);
         let latest_server_time = Arc::new(Mutex::new(None));
         let latest_server_time_notify = Arc::new(Notify::new());
+        let latest_object_updates = Arc::new(Mutex::new(LatestObjectUpdates::default()));
+        let latest_object_updates_notify = Arc::new(Notify::new());
 
         if let Err(err) = stream.set_nodelay(true) {
             warn!(client_id = id, "failed to enable TCP_NODELAY: {err:?}");
@@ -323,8 +331,8 @@ impl Client {
             tx_client,
             latest_server_time,
             latest_server_time_notify,
-            lossy_drop_last_log_ms: AtomicU64::new(0),
-            lossy_drop_suppressed: AtomicU64::new(0),
+            latest_object_updates,
+            latest_object_updates_notify,
         };
 
         client.event_loop(stream, rx_server);
@@ -342,21 +350,113 @@ fn take_latest_server_time(slot: &LatestServerTimeSlot) -> Option<Vec<u8>> {
     pending.take()
 }
 
+#[derive(Default)]
+struct LatestObjectUpdates {
+    order: VecDeque<i32>,
+    packets: HashMap<i32, Vec<u8>>,
+}
+
+impl LatestObjectUpdates {
+    fn replace(&mut self, object_id: i32, data: Vec<u8>) -> bool {
+        let replaced = self.packets.insert(object_id, data).is_some();
+        if !replaced {
+            self.order.push_back(object_id);
+        }
+        replaced
+    }
+
+    fn take_next(&mut self) -> Option<Vec<u8>> {
+        while let Some(object_id) = self.order.pop_front() {
+            if let Some(data) = self.packets.remove(&object_id) {
+                return Some(data);
+            }
+        }
+        None
+    }
+
+    fn remove(&mut self, object_id: i32) -> bool {
+        let removed = self.packets.remove(&object_id).is_some();
+        if removed {
+            self.order.retain(|&queued_id| queued_id != object_id);
+        }
+        removed
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.packets.len()
+    }
+}
+
+fn replace_latest_object_update(
+    slot: &LatestObjectUpdatesSlot,
+    object_id: i32,
+    data: Vec<u8>,
+) -> bool {
+    let mut pending = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.replace(object_id, data)
+}
+
+fn take_next_latest_object_update(slot: &LatestObjectUpdatesSlot) -> Option<Vec<u8>> {
+    let mut pending = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.take_next()
+}
+
+fn remove_latest_object_update(slot: &LatestObjectUpdatesSlot, object_id: i32) -> bool {
+    let mut pending = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.remove(object_id)
+}
+
+fn packet_object_id(packet: &Packet) -> Option<i32> {
+    let id = packet.data.get(0..4)?;
+    Some(i32::from_le_bytes([id[0], id[1], id[2], id[3]]))
+}
+
 async fn writer_loop<W>(
     mut sw: W,
     mut rx_server: Receiver<Vec<u8>>,
     latest_server_time: LatestServerTimeSlot,
     latest_server_time_notify: Arc<Notify>,
+    latest_object_updates: LatestObjectUpdatesSlot,
+    latest_object_updates_notify: Arc<Notify>,
     peer: String,
 ) where
     W: AsyncWrite + Unpin,
 {
+    let mut rx_server_closed = false;
+
     loop {
         if let Some(data) = take_latest_server_time(&latest_server_time) {
             if !write_client_packet(&mut sw, &data, &peer).await {
                 break;
             }
             continue;
+        }
+
+        if !rx_server_closed {
+            match rx_server.try_recv() {
+                Ok(data) => {
+                    if !write_client_packet(&mut sw, &data, &peer).await {
+                        break;
+                    }
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    rx_server_closed = true;
+                }
+            }
+        }
+
+        if let Some(data) = take_next_latest_object_update(&latest_object_updates) {
+            if !write_client_packet(&mut sw, &data, &peer).await {
+                break;
+            }
+            continue;
+        }
+
+        if rx_server_closed {
+            break;
         }
 
         ::tokio::select! {
@@ -371,8 +471,13 @@ async fn writer_loop<W>(
                             break;
                         }
                     }
-                    None => break,
+                    None => {
+                        rx_server_closed = true;
+                    }
                 }
+            }
+            _ = latest_object_updates_notify.notified() => {
+                continue;
             }
         }
     }
@@ -466,6 +571,7 @@ async fn auth(stream: &mut TcpStream) -> Result<u8, AuthError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -487,10 +593,35 @@ mod tests {
                 tx_client,
                 latest_server_time: Arc::new(Mutex::new(None)),
                 latest_server_time_notify: Arc::new(Notify::new()),
-                lossy_drop_last_log_ms: AtomicU64::new(0),
-                lossy_drop_suppressed: AtomicU64::new(0),
+                latest_object_updates: Arc::new(Mutex::new(LatestObjectUpdates::default())),
+                latest_object_updates_notify: Arc::new(Notify::new()),
             },
             rx_client,
+        )
+    }
+
+    fn make_update_packet(object_id: i32, time: i32) -> Packet {
+        Packet::new(
+            Action::UPDATE_OBJECT,
+            &std::iter::empty()
+                .chain(&object_id.to_le_bytes())
+                .chain(&time.to_le_bytes())
+                .chain(&10i16.to_le_bytes())
+                .chain(&20i16.to_le_bytes())
+                .chain(&[1, 2, 3])
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn make_object_lifecycle_packet(action: Action, object_id: i32) -> Packet {
+        Packet::new(
+            action,
+            &std::iter::empty()
+                .chain(&object_id.to_le_bytes())
+                .chain(&1i32.to_le_bytes())
+                .copied()
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -510,16 +641,176 @@ mod tests {
     }
 
     #[test]
-    fn lossy_realtime_packet_is_dropped_when_queue_is_full() {
+    fn update_object_uses_reliable_fifo_by_default() {
         let (client, mut rx_client) = test_client(1);
-        let first = Packet::new(Action::UPDATE_OBJECT, &[1]);
-        let second = Packet::new(Action::UPDATE_OBJECT, &[2]);
+        let update = make_update_packet(1, 10);
 
-        client.send(&first);
-        client.send(&second);
+        client.send(&update);
 
-        assert_eq!(rx_client.try_recv().unwrap(), first.as_bytes());
+        assert_eq!(rx_client.try_recv().unwrap(), update.as_bytes());
         assert!(rx_client.try_recv().is_err());
+    }
+
+    #[test]
+    fn realtime_update_uses_latest_object_slot_instead_of_fifo_queue() {
+        let (client, mut rx_client) = test_client(10);
+        let update = make_update_packet(1, 10);
+
+        client.send_realtime_update(&update);
+
+        assert!(rx_client.try_recv().is_err());
+        assert_eq!(
+            take_next_latest_object_update(&client.latest_object_updates).unwrap(),
+            update.as_bytes()
+        );
+        assert!(take_next_latest_object_update(&client.latest_object_updates).is_none());
+    }
+
+    #[test]
+    fn newer_realtime_update_replaces_pending_update_for_same_object() {
+        let (client, mut rx_client) = test_client(10);
+        let old = make_update_packet(1, 10);
+        let new = make_update_packet(1, 20);
+
+        client.send_realtime_update(&old);
+        client.send_realtime_update(&new);
+
+        assert!(rx_client.try_recv().is_err());
+        assert_eq!(
+            take_next_latest_object_update(&client.latest_object_updates).unwrap(),
+            new.as_bytes()
+        );
+        assert!(take_next_latest_object_update(&client.latest_object_updates).is_none());
+    }
+
+    #[test]
+    fn different_realtime_objects_are_kept_independently() {
+        let (client, mut rx_client) = test_client(10);
+        let first = make_update_packet(1, 10);
+        let second = make_update_packet(2, 20);
+        let third = make_update_packet(3, 30);
+
+        client.send_realtime_update(&first);
+        client.send_realtime_update(&second);
+        client.send_realtime_update(&third);
+
+        assert!(rx_client.try_recv().is_err());
+        assert_eq!(
+            client.latest_object_updates.lock().unwrap().len(),
+            3,
+            "three different object ids must remain independently pending"
+        );
+        assert_eq!(
+            take_next_latest_object_update(&client.latest_object_updates).unwrap(),
+            first.as_bytes()
+        );
+        assert_eq!(
+            take_next_latest_object_update(&client.latest_object_updates).unwrap(),
+            second.as_bytes()
+        );
+        assert_eq!(
+            take_next_latest_object_update(&client.latest_object_updates).unwrap(),
+            third.as_bytes()
+        );
+    }
+
+    #[test]
+    fn replacement_does_not_duplicate_object_queue_key() {
+        let (client, mut rx_client) = test_client(10);
+        let first = make_update_packet(1, 10);
+        let second = make_update_packet(1, 20);
+        let third = make_update_packet(1, 30);
+
+        client.send_realtime_update(&first);
+        client.send_realtime_update(&second);
+        client.send_realtime_update(&third);
+
+        assert!(rx_client.try_recv().is_err());
+        assert_eq!(
+            client.latest_object_updates.lock().unwrap().len(),
+            1,
+            "replacing one object must not enqueue duplicate ids"
+        );
+        assert_eq!(
+            take_next_latest_object_update(&client.latest_object_updates).unwrap(),
+            third.as_bytes()
+        );
+        assert!(take_next_latest_object_update(&client.latest_object_updates).is_none());
+    }
+
+    #[test]
+    fn delete_object_drops_pending_realtime_update_for_same_object() {
+        let (client, mut rx_client) = test_client(10);
+        let update = make_update_packet(1, 10);
+        let delete = make_object_lifecycle_packet(Action::DELETE_OBJECT, 1);
+
+        client.send_realtime_update(&update);
+        client.send(&delete);
+
+        assert_eq!(rx_client.try_recv().unwrap(), delete.as_bytes());
+        assert!(take_next_latest_object_update(&client.latest_object_updates).is_none());
+    }
+
+    #[test]
+    fn hide_object_drops_pending_realtime_update_for_same_object() {
+        let (client, mut rx_client) = test_client(10);
+        let update = make_update_packet(1, 10);
+        let hide = make_object_lifecycle_packet(Action::HIDE_OBJECT, 1);
+
+        client.send_realtime_update(&update);
+        client.send(&hide);
+
+        assert_eq!(rx_client.try_recv().unwrap(), hide.as_bytes());
+        assert!(take_next_latest_object_update(&client.latest_object_updates).is_none());
+    }
+
+    #[test]
+    fn malformed_realtime_update_falls_back_to_reliable_fifo() {
+        let (client, mut rx_client) = test_client(10);
+        let malformed = Packet::new(Action::UPDATE_OBJECT, &[1, 2, 3]);
+
+        client.send_realtime_update(&malformed);
+
+        assert_eq!(rx_client.try_recv().unwrap(), malformed.as_bytes());
+        assert!(take_next_latest_object_update(&client.latest_object_updates).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_realtime_updates_keep_one_pending_packet_per_object() {
+        let (client, mut rx_client) = test_client(10);
+        let client = Arc::new(client);
+        let mut tasks = Vec::new();
+
+        for i in 0..200 {
+            let client = Arc::clone(&client);
+            tasks.push(::tokio::spawn(async move {
+                let object_id = 1 + (i % 8);
+                let update = make_update_packet(object_id, i);
+                client.send_realtime_update(&update);
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert!(rx_client.try_recv().is_err());
+        assert_eq!(client.latest_object_updates.lock().unwrap().len(), 8);
+
+        let mut seen = HashSet::new();
+        while let Some(data) = take_next_latest_object_update(&client.latest_object_updates) {
+            let packet = Packet::from_slice(&data);
+            let object_id = packet_object_id(&packet).unwrap();
+            assert!(
+                (1..=8).contains(&object_id),
+                "unexpected object_id={object_id}"
+            );
+            assert!(
+                seen.insert(object_id),
+                "object_id={object_id} appeared more than once"
+            );
+        }
+        assert_eq!(seen.len(), 8);
     }
 
     #[test]
@@ -577,6 +868,8 @@ mod tests {
         let (tx_client, rx_server) = mpsc::channel::<Vec<u8>>(10);
         let latest_server_time = Arc::new(Mutex::new(None));
         let latest_server_time_notify = Arc::new(Notify::new());
+        let latest_object_updates = Arc::new(Mutex::new(LatestObjectUpdates::default()));
+        let latest_object_updates_notify = Arc::new(Notify::new());
 
         let fifo = Packet::new(Action::PLAYERS_DATA, &[1]);
         let server_time = Packet::new(Action::SERVER_TIME, &[2, 0, 0, 0]);
@@ -589,6 +882,8 @@ mod tests {
             rx_server,
             Arc::clone(&latest_server_time),
             Arc::clone(&latest_server_time_notify),
+            Arc::clone(&latest_object_updates),
+            Arc::clone(&latest_object_updates_notify),
             "test-peer".to_string(),
         ));
 
@@ -604,6 +899,8 @@ mod tests {
         let (_tx_client, rx_server) = mpsc::channel::<Vec<u8>>(10);
         let latest_server_time = Arc::new(Mutex::new(None));
         let latest_server_time_notify = Arc::new(Notify::new());
+        let latest_object_updates = Arc::new(Mutex::new(LatestObjectUpdates::default()));
+        let latest_object_updates_notify = Arc::new(Notify::new());
 
         let (mut reader, writer) = duplex(1024);
         let writer_task = ::tokio::spawn(writer_loop(
@@ -611,6 +908,8 @@ mod tests {
             rx_server,
             Arc::clone(&latest_server_time),
             Arc::clone(&latest_server_time_notify),
+            Arc::clone(&latest_object_updates),
+            Arc::clone(&latest_object_updates_notify),
             "test-peer".to_string(),
         ));
 
@@ -622,6 +921,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(packet, server_time.as_bytes());
+
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn writer_sends_fifo_before_realtime_object_update() {
+        let (tx_client, rx_server) = mpsc::channel::<Vec<u8>>(10);
+        let latest_server_time = Arc::new(Mutex::new(None));
+        let latest_server_time_notify = Arc::new(Notify::new());
+        let latest_object_updates = Arc::new(Mutex::new(LatestObjectUpdates::default()));
+        let latest_object_updates_notify = Arc::new(Notify::new());
+
+        let fifo = Packet::new(Action::PLAYERS_DATA, &[1]);
+        let update = make_update_packet(1, 10);
+        tx_client.try_send(fifo.as_bytes()).unwrap();
+        replace_latest_object_update(&latest_object_updates, 1, update.as_bytes());
+
+        let (mut reader, writer) = duplex(1024);
+        let writer_task = ::tokio::spawn(writer_loop(
+            writer,
+            rx_server,
+            Arc::clone(&latest_server_time),
+            Arc::clone(&latest_server_time_notify),
+            Arc::clone(&latest_object_updates),
+            Arc::clone(&latest_object_updates_notify),
+            "test-peer".to_string(),
+        ));
+
+        assert_eq!(read_packet(&mut reader).await, fifo.as_bytes());
+        assert_eq!(read_packet(&mut reader).await, update.as_bytes());
+
+        drop(tx_client);
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn writer_observes_realtime_object_notify_without_fifo_activity() {
+        let (_tx_client, rx_server) = mpsc::channel::<Vec<u8>>(10);
+        let latest_server_time = Arc::new(Mutex::new(None));
+        let latest_server_time_notify = Arc::new(Notify::new());
+        let latest_object_updates = Arc::new(Mutex::new(LatestObjectUpdates::default()));
+        let latest_object_updates_notify = Arc::new(Notify::new());
+
+        let (mut reader, writer) = duplex(1024);
+        let writer_task = ::tokio::spawn(writer_loop(
+            writer,
+            rx_server,
+            Arc::clone(&latest_server_time),
+            Arc::clone(&latest_server_time_notify),
+            Arc::clone(&latest_object_updates),
+            Arc::clone(&latest_object_updates_notify),
+            "test-peer".to_string(),
+        ));
+
+        let update = make_update_packet(1, 10);
+        replace_latest_object_update(&latest_object_updates, 1, update.as_bytes());
+        latest_object_updates_notify.notify_one();
+
+        let packet = ::tokio::time::timeout(Duration::from_secs(1), read_packet(&mut reader))
+            .await
+            .unwrap();
+        assert_eq!(packet, update.as_bytes());
 
         writer_task.abort();
     }

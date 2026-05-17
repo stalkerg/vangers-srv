@@ -157,8 +157,12 @@ impl Server {
             .collect::<Vec<_>>();
 
         for client_id in expired_client_ids {
-            if let Err(err) = self.close_socket(&Packet::new(Action::CLOSE_SOCKET, &[]), client_id) {
-                error!("failed to expire disconnected player client_id=`{}`: {}", client_id, err);
+            if let Err(err) = self.close_socket(&Packet::new(Action::CLOSE_SOCKET, &[]), client_id)
+            {
+                error!(
+                    "failed to expire disconnected player client_id=`{}`: {}",
+                    client_id, err
+                );
             }
         }
     }
@@ -193,6 +197,36 @@ impl Server {
             .for_each(|c| c.send(packet));
     }
 
+    pub fn notify_realtime_update(
+        &self,
+        client_id: ClientID,
+        packet: &Packet,
+        filter: Box<dyn Fn(&ClientID) -> bool>,
+    ) {
+        let game = match self.get_game_by_clientid(client_id) {
+            Some(game) => game,
+            None => {
+                error!(
+                    "cannot doing notify_realtime_update: player with client_id=`{}` not found on the server",
+                    client_id
+                );
+                return;
+            }
+        };
+
+        let client_ids = game
+            .players
+            .iter()
+            .map(|p| p.client_id)
+            .filter(filter)
+            .collect::<Vec<_>>();
+
+        self.clients
+            .iter()
+            .filter(|c| client_ids.contains(&c.id))
+            .for_each(|c| c.send_realtime_update(packet));
+    }
+
     /// Sends `packet` to the current client only.
     pub fn notify_player(&self, client_id: ClientID, packet: &Packet) {
         self.notify(client_id, packet, Box::new(move |&id| id == client_id));
@@ -201,6 +235,12 @@ impl Server {
     /// Sends `packet` to all clients in the game exclude a caller client `client_id`.
     pub fn notify_game(&self, client_id: ClientID, packet: &Packet) {
         self.notify(client_id, packet, Box::new(move |&id| id != client_id));
+    }
+
+    /// Sends replaceable realtime `UPDATE_OBJECT` to all clients in the game
+    /// except the caller client `client_id`.
+    pub fn notify_game_realtime_update(&self, client_id: ClientID, packet: &Packet) {
+        self.notify_realtime_update(client_id, packet, Box::new(move |&id| id != client_id));
     }
 
     /// Sends `packet` to all clients.
@@ -232,6 +272,33 @@ impl Server {
             .iter()
             .filter(|c| client_ids.contains(&c.id))
             .for_each(|c| c.send(packet));
+    }
+
+    /// Sends replaceable realtime `UPDATE_OBJECT` to players that are currently
+    /// attached to the same world.
+    pub fn notify_world_realtime_update(
+        &self,
+        client_id: ClientID,
+        world_id: u8,
+        packet: &Packet,
+        include_sender: bool,
+    ) {
+        let game = match self.get_game_by_clientid(client_id) {
+            Some(game) => game,
+            None => {
+                error!(
+                    "cannot doing notify_world_realtime_update: player with client_id=`{}` not found on the server",
+                    client_id
+                );
+                return;
+            }
+        };
+
+        let client_ids = client_ids_in_world(game, world_id, Some(client_id), include_sender);
+        self.clients
+            .iter()
+            .filter(|c| client_ids.contains(&c.id))
+            .for_each(|c| c.send_realtime_update(packet));
     }
 
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -349,7 +416,7 @@ fn client_ids_in_world(
 
 #[cfg(test)]
 mod tests {
-    use super::{client_ids_in_world, Server};
+    use super::{Server, client_ids_in_world};
     use crate::game::{Game, World};
     use crate::player::Player;
     use std::cell::RefCell;

@@ -1,6 +1,6 @@
 use crate::Server;
 use crate::protocol::{Action, Packet};
-use crate::vanject::{DecodedVanjectId, VanjectError};
+use crate::vanject::{DecodedVanjectId, NID, VanjectError, get_vanject_type};
 use crate::{client::ClientID, utils::slice_le_to_i32};
 use ::tracing::{info, warn};
 
@@ -66,6 +66,7 @@ impl OnUpdate_UpdateObject for Server {
             )
         };
 
+        let coalesce_realtime = is_realtime_coalesced_update(&decoded);
         let (packet, is_non_global, world_id) = match game.vanjects.get_mut(&vanject_id) {
             Some(vanject) => {
                 let is_non_global = vanject.is_non_global();
@@ -155,7 +156,12 @@ impl OnUpdate_UpdateObject for Server {
                         packet_sender = client_id,
                         packet_world = player_world_id.unwrap_or(255),
                         stored_world,
-                        decision = if is_non_global { "accepted_notify_world" } else { "accepted_notify_game" },
+                        decision = match (is_non_global, coalesce_realtime) {
+                            (true, true) => "accepted_notify_world_realtime",
+                            (true, false) => "accepted_notify_world",
+                            (false, true) => "accepted_notify_game_realtime",
+                            (false, false) => "accepted_notify_game",
+                        },
                         "object lifecycle"
                     );
                 }
@@ -191,7 +197,13 @@ impl OnUpdate_UpdateObject for Server {
         };
 
         let _ = game;
-        if is_non_global {
+        if coalesce_realtime {
+            if is_non_global {
+                self.notify_world_realtime_update(client_id, world_id, &packet, false);
+            } else {
+                self.notify_game_realtime_update(client_id, &packet);
+            }
+        } else if is_non_global {
             self.notify_world(client_id, world_id, &packet, false);
         } else {
             self.notify_game(client_id, &packet);
@@ -199,6 +211,10 @@ impl OnUpdate_UpdateObject for Server {
 
         Ok(OnUpdateOk::Complete)
     }
+}
+
+fn is_realtime_coalesced_update(decoded: &DecodedVanjectId) -> bool {
+    get_vanject_type(decoded.id) == NID::VANGER
 }
 
 #[cfg(test)]
@@ -265,6 +281,21 @@ mod tests {
 
         srv.games.insert(1, game);
         (srv, owner_client, other_client, vanject_id)
+    }
+
+    #[test]
+    fn coalesces_only_vanger_realtime_updates() {
+        let vanger = DecodedVanjectId::new(make_id(1, 1, NID::VANGER, 2));
+        let slot = DecodedVanjectId::new(make_id(1, 1, NID::SLOT, 2));
+        let stuff = DecodedVanjectId::new(make_id(1, 1, NID::STUFF, 2));
+        let global = DecodedVanjectId::new(make_id(0, 1, NID::GLOBAL, 83));
+        let tnt = DecodedVanjectId::new(make_id(1, 1, NID::TNT, 2));
+
+        assert!(is_realtime_coalesced_update(&vanger));
+        assert!(!is_realtime_coalesced_update(&slot));
+        assert!(!is_realtime_coalesced_update(&stuff));
+        assert!(!is_realtime_coalesced_update(&global));
+        assert!(!is_realtime_coalesced_update(&tnt));
     }
 
     #[test]
