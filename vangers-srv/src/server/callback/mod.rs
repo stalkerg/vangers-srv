@@ -5,6 +5,7 @@ mod delete_object;
 mod direct_sending;
 mod games_list_query;
 mod get_game_data;
+mod item_transfer;
 mod leave_world;
 mod register_name;
 mod restore_connection;
@@ -24,6 +25,7 @@ use delete_object::*;
 use direct_sending::*;
 use games_list_query::*;
 use get_game_data::*;
+use item_transfer::*;
 use leave_world::*;
 use register_name::*;
 use restore_connection::*;
@@ -72,6 +74,8 @@ pub enum OnUpdateError {
     DeleteObjectError(#[from] DeleteObjectError),
     #[error("DirectSendingError: {0}")]
     DirectSendingError(#[from] DirectSendingError),
+    #[error("ItemTransferError: {0}")]
+    ItemTransferError(#[from] ItemTransferError),
     #[error("TotalPlayersDataQueryError: {0}")]
     TotalPlayersDataQueryError(#[from] TotalPlayersDataQueryError),
     #[error("SetWorldError: {0}")]
@@ -144,6 +148,7 @@ impl OnUpdate for Server {
             Action::LEAVE_WORLD => self.leave_world(&packet, client_id),
             Action::UPDATE_OBJECT => self.update_object(&packet, client_id),
             Action::DELETE_OBJECT => self.delete_object(&packet, client_id),
+            Action::ITEM_TRANSFER => self.item_transfer(&packet, client_id),
             Action::DIRECT_SENDING => self.direct_sending(&packet, client_id),
             Action::CLOSE_SOCKET => self.close_socket(&packet, client_id),
             _ => Err(OnUpdateError::NotImplementedAction(packet.clone())),
@@ -204,7 +209,8 @@ fn view(prefix: &str, p: &Packet, conf: &ServerConfig) {
     use Action::*;
 
     match &p.action {
-        a @ (CREATE_OBJECT | UPDATE_OBJECT | DELETE_OBJECT) => {
+        a @ (CREATE_OBJECT | UPDATE_OBJECT | DELETE_OBJECT | ITEM_TRANSFER | ITEM_STATE
+        | ITEM_REMOVED) => {
             trace!("{} {:?}: {:X?}", prefix, a, &p.data);
         }
         a @ (SERVER_TIME | SERVER_TIME_QUERY | SERVER_TIME_RESPONSE) => {

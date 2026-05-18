@@ -4,6 +4,7 @@ use crate::vanject::{DecodedVanjectId, NID, VanjectError, get_vanject_type};
 use crate::{client::ClientID, utils::slice_le_to_i32};
 use ::tracing::{info, warn};
 
+use super::item_transfer::{is_item_vanject, item_state_packet};
 use super::{OnUpdateError, OnUpdateOk};
 
 #[derive(Debug, ::thiserror::Error)]
@@ -165,11 +166,13 @@ impl OnUpdate_UpdateObject for Server {
                         "object lifecycle"
                     );
                 }
-                (
-                    Packet::new(Action::UPDATE_OBJECT, &vanject.to_vangers_byte()),
-                    is_non_global,
-                    world_id,
-                )
+                let packet = if is_item_vanject(vanject) {
+                    item_state_packet(0, vanject)
+                } else {
+                    Packet::new(Action::UPDATE_OBJECT, &vanject.to_vangers_byte())
+                };
+
+                (packet, is_non_global, world_id)
             }
             None => {
                 warn!(

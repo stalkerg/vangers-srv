@@ -2,7 +2,8 @@ use ::tracing::warn;
 
 use crate::Server;
 use crate::client::ClientID;
-use crate::protocol::{NetTransportSend, Packet};
+use crate::game::Game;
+use crate::protocol::{Action, NetTransportSend, Packet};
 
 use super::{OnUpdateError, OnUpdateOk};
 
@@ -16,7 +17,7 @@ pub enum TotalPlayersDataQueryError {
 pub(super) trait OnUpdate_TotalPlayersDataQuery {
     fn total_players_data_query(
         &mut self,
-        packet: &Packet,
+        _packet: &Packet,
         client_id: ClientID,
     ) -> Result<OnUpdateOk, OnUpdateError>;
 }
@@ -25,7 +26,7 @@ impl OnUpdate_TotalPlayersDataQuery for Server {
     #[tracing::instrument(skip_all)]
     fn total_players_data_query(
         &mut self,
-        packet: &Packet,
+        _packet: &Packet,
         client_id: ClientID,
     ) -> Result<OnUpdateOk, OnUpdateError> {
         let game = match self.get_mut_game_by_clientid(client_id) {
@@ -33,74 +34,75 @@ impl OnUpdate_TotalPlayersDataQuery for Server {
             None => return Err(TotalPlayersDataQueryError::PlayerNotFound(client_id).into()),
         };
 
-        let mut data = vec![(game.players.len() + game.removed_players.len()) as u8];
-        let mut players_count = 0;
-        for player in &game.players {
-            let id = match player.bind {
-                Some(bind) => bind.id(),
-                None => continue,
-            };
-
-            let status = player.status as u8;
-
-            let world = match player.world {
-                Some(ref world) => world.borrow().id,
-                None => 0u8,
-            };
-
-            let name = match player.auth {
-                Some(ref auth) => auth.name(),
-                None => b"[UNDEFINED]\0", // is it possible (?)
-            };
-
-            let body = match player.body {
-                Some(ref body) => body.to_vangers_byte(),
-                None => {
-                    warn!(
-                        "Player with (bind_id={} client_id={}) has no `body` property, ignored the player",
-                        id, player.client_id
-                    );
-                    continue;
-                }
-            };
-
-            let mut p_data = std::iter::empty()
-                .chain(&[id])
-                .chain(&[status])
-                .chain(&[world])
-                .chain(&player.pos.to_vangers_byte())
-                .chain(name)
-                .chain(&body)
-                .copied()
-                .collect::<Vec<_>>();
-
-            data.append(&mut p_data);
-
-            players_count += 1;
-        }
-
-        for player in &game.removed_players {
-            let mut p_data = std::iter::empty()
-                .chain(&[player.bind_id])
-                .chain(&[player.status as u8])
-                .chain(&[player.world])
-                .chain(&player.pos.to_vangers_byte())
-                .chain(&player.name)
-                .chain(&player.body)
-                .copied()
-                .collect::<Vec<_>>();
-
-            data.append(&mut p_data);
-            players_count += 1;
-        }
-
-        data[0] = players_count;
-
-        packet
-            .create_answer(data)
-            .map(OnUpdateOk::Response)
-            .ok_or(OnUpdateError::ResponsePacketTypeNotExist(packet.action))
+        Ok(OnUpdateOk::Response(total_players_data_packet(game)))
     }
+}
+
+pub(super) fn total_players_data_packet(game: &Game) -> Packet {
+    let mut data = vec![(game.players.len() + game.removed_players.len()) as u8];
+    let mut players_count = 0;
+    for player in &game.players {
+        let id = match player.bind {
+            Some(bind) => bind.id(),
+            None => continue,
+        };
+
+        let status = player.status as u8;
+
+        let world = match player.world {
+            Some(ref world) => world.borrow().id,
+            None => 0u8,
+        };
+
+        let name = match player.auth {
+            Some(ref auth) => auth.name(),
+            None => b"[UNDEFINED]\0", // is it possible (?)
+        };
+
+        let body = match player.body {
+            Some(ref body) => body.to_vangers_byte(),
+            None => {
+                warn!(
+                    "Player with (bind_id={} client_id={}) has no `body` property, ignored the player",
+                    id, player.client_id
+                );
+                continue;
+            }
+        };
+
+        let mut p_data = std::iter::empty()
+            .chain(&[id])
+            .chain(&[status])
+            .chain(&[world])
+            .chain(&player.pos.to_vangers_byte())
+            .chain(name)
+            .chain(&body)
+            .copied()
+            .collect::<Vec<_>>();
+
+        data.append(&mut p_data);
+
+        players_count += 1;
+    }
+
+    for player in &game.removed_players {
+        let mut p_data = std::iter::empty()
+            .chain(&[player.bind_id])
+            .chain(&[player.status as u8])
+            .chain(&[player.world])
+            .chain(&player.pos.to_vangers_byte())
+            .chain(&player.name)
+            .chain(&player.body)
+            .copied()
+            .collect::<Vec<_>>();
+
+        data.append(&mut p_data);
+        players_count += 1;
+    }
+
+    data[0] = players_count;
+
+    Packet::new(Action::TOTAL_LIST_OF_PLAYERS_DATA, &data)
 }
 
 #[cfg(test)]
@@ -134,7 +136,10 @@ mod tests {
         srv.games.insert(1, game);
 
         let response = srv
-            .total_players_data_query(&Packet::new(Action::TOTAL_PLAYERS_DATA_QUERY, &[]), client_id)
+            .total_players_data_query(
+                &Packet::new(Action::TOTAL_PLAYERS_DATA_QUERY, &[]),
+                client_id,
+            )
             .unwrap();
 
         match response {

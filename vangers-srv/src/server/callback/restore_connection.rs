@@ -82,17 +82,21 @@ mod tests {
         let old_client_id: ClientID = 11;
         let new_client_id: ClientID = 22;
         let bind_id = game.attach_player(Player::new(old_client_id)).unwrap();
-        game.get_mut_player(old_client_id).unwrap().disconnected_until =
-            Some(Instant::now() + Duration::from_secs(60));
+        game.get_mut_player(old_client_id)
+            .unwrap()
+            .disconnected_until = Some(Instant::now() + Duration::from_secs(60));
         srv.games.insert(1, game);
 
-        let packet = Packet::new(Action::RESTORE_CONNECTION, &[
-            1u32.to_le_bytes()[0],
-            1u32.to_le_bytes()[1],
-            1u32.to_le_bytes()[2],
-            1u32.to_le_bytes()[3],
-            bind_id,
-        ]);
+        let packet = Packet::new(
+            Action::RESTORE_CONNECTION,
+            &[
+                1u32.to_le_bytes()[0],
+                1u32.to_le_bytes()[1],
+                1u32.to_le_bytes()[2],
+                1u32.to_le_bytes()[3],
+                bind_id,
+            ],
+        );
 
         let response = srv.restore_connection(&packet, new_client_id).unwrap();
 
@@ -116,13 +120,16 @@ mod tests {
         let mut srv = Server::new(Default::default());
         srv.games.insert(1, Game::new(1));
 
-        let packet = Packet::new(Action::RESTORE_CONNECTION, &[
-            1u32.to_le_bytes()[0],
-            1u32.to_le_bytes()[1],
-            1u32.to_le_bytes()[2],
-            1u32.to_le_bytes()[3],
-            1,
-        ]);
+        let packet = Packet::new(
+            Action::RESTORE_CONNECTION,
+            &[
+                1u32.to_le_bytes()[0],
+                1u32.to_le_bytes()[1],
+                1u32.to_le_bytes()[2],
+                1u32.to_le_bytes()[3],
+                1,
+            ],
+        );
 
         let response = srv.restore_connection(&packet, 22).unwrap();
 

@@ -48,6 +48,7 @@ pub enum Action {
     GET_GAME_DATA = 0x93,
     SET_PLAYER_DATA = 0x94,
     DIRECT_SENDING = 0x95,
+    ITEM_TRANSFER = 0x96,
 
     // response to client
     GAMES_LIST_RESPONSE = 0xC1,
@@ -66,6 +67,10 @@ pub enum Action {
     PLAYERS_STATUS = 0xD2,
     PLAYERS_DATA = 0xD3,
     PLAYERS_RATING = 0xD4,
+    WORLD_SNAPSHOT_BEGIN = 0xD6,
+    WORLD_SNAPSHOT_END = 0xD7,
+    ITEM_STATE = 0xD8,
+    ITEM_REMOVED = 0xD9,
     Z_TIME_RESPONSE = 0xE3,
 }
 
@@ -242,6 +247,9 @@ mod test {
             Action::CREATE_OBJECT,
             Action::HIDE_OBJECT,
             Action::DIRECT_RECEIVING,
+            Action::ITEM_TRANSFER,
+            Action::ITEM_STATE,
+            Action::ITEM_REMOVED,
         ] {
             assert!(
                 !action.is_lossy_realtime(),

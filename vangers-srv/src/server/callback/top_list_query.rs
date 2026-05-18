@@ -132,13 +132,16 @@ mod tests {
         p3.body = Some(body_with_rating(7.0));
         p3.status = Status::FINISHED;
         game.attach_player(p3);
-        let snapshot = crate::game::RemovedPlayer::from_player(game.get_player(33).unwrap()).unwrap();
+        let snapshot =
+            crate::game::RemovedPlayer::from_player(game.get_player(33).unwrap()).unwrap();
         game.removed_players.push(snapshot);
         game.players.retain(|p| p.client_id != 33);
 
         srv.games.insert(1, game);
 
-        let response = srv.top_list_query(&request(GameType::PASSEMBLOSS), 1).unwrap();
+        let response = srv
+            .top_list_query(&request(GameType::PASSEMBLOSS), 1)
+            .unwrap();
         let packet = match response {
             OnUpdateOk::Response(packet) => packet,
             other => panic!("unexpected response: {other:?}"),
@@ -165,7 +168,10 @@ mod tests {
             cursor += 4;
         }
 
-        assert_eq!(names, vec![b"beta\0".to_vec(), b"gamma\0".to_vec(), b"alpha\0".to_vec()]);
+        assert_eq!(
+            names,
+            vec![b"beta\0".to_vec(), b"gamma\0".to_vec(), b"alpha\0".to_vec()]
+        );
         assert_eq!(ratings, vec![9.0, 7.0, 5.0]);
     }
 
@@ -189,7 +195,9 @@ mod tests {
         game2.attach_player(p2);
         srv.games.insert(2, game2);
 
-        let response = srv.top_list_query(&request(GameType::PASSEMBLOSS), 1).unwrap();
+        let response = srv
+            .top_list_query(&request(GameType::PASSEMBLOSS), 1)
+            .unwrap();
         let packet = match response {
             OnUpdateOk::Response(packet) => packet,
             other => panic!("unexpected response: {other:?}"),

@@ -384,7 +384,7 @@ mod tests {
 
         const HS_IN: &[u8] = b"Vivat Sicher, Rock'n'Roll forever!!!";
         const HS_OUT: &[u8] = b"Enter, my son, please...";
-        const PROTOCOL_VERSION: u8 = 4;
+        const PROTOCOL_VERSION: u8 = 5;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

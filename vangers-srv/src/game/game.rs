@@ -7,8 +7,8 @@ use std::rc::Rc;
 use crate::client::ClientID;
 use crate::player::{Player, Status as PlayerStatus};
 use crate::protocol::{NetTransportReceive, NetTransportSend};
-use crate::vanject::Pos;
 use crate::utils::Uptime;
+use crate::vanject::Pos;
 use crate::vanject::Vanject;
 
 use super::Config;
@@ -204,7 +204,8 @@ impl Game {
     pub fn attach_player(&mut self, mut p: Player) -> Option<u8> {
         match self.get_uniq_player_id() {
             Some(uniq_id) if uniq_id > 0 => {
-                self.removed_players.retain(|player| player.bind_id != uniq_id);
+                self.removed_players
+                    .retain(|player| player.bind_id != uniq_id);
                 p.set_bind(uniq_id);
                 self.players.push(p);
                 Some(uniq_id)
