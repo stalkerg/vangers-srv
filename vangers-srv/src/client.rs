@@ -14,6 +14,7 @@ use super::protocol::*;
 
 const HS_IN: &[u8] = b"Vivat Sicher, Rock'n'Roll forever!!!";
 const HS_OUT: &[u8] = b"Enter, my son, please...";
+pub(crate) const PROTOCOL_VERSION: u8 = 6;
 
 pub type ClientID = usize;
 type LatestServerTimeSlot = Arc<Mutex<Option<Vec<u8>>>>;
@@ -643,7 +644,6 @@ enum AuthError {
 async fn auth(stream: &mut TcpStream) -> Result<u8, AuthError> {
     use AuthError::*;
 
-    const PROTOCOL_VERSION: u8 = 5;
     const HS_TOTAL_LEN: usize = HS_IN.len() + 2; // magic + '\0' + version
 
     let mut received = Vec::with_capacity(HS_TOTAL_LEN);
@@ -711,7 +711,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use ::tokio::io::{AsyncRead, AsyncReadExt, duplex};
+    use ::tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, duplex};
+    use ::tokio::net::{TcpListener, TcpStream};
     use ::tokio::sync::mpsc;
 
     use super::*;
@@ -724,7 +725,7 @@ mod tests {
             Client {
                 id: 1,
                 connection: Connection::Connected,
-                protocol: 5,
+                protocol: PROTOCOL_VERSION,
                 tx_server,
                 tx_client,
                 latest_server_time: Arc::new(Mutex::new(None)),
@@ -775,6 +776,59 @@ mod tests {
         let mut packet = header.to_vec();
         packet.extend_from_slice(&body);
         packet
+    }
+
+    async fn authenticate_version(version: u8) -> (Result<u8, AuthError>, Vec<u8>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = ::tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let request = HS_IN
+                .iter()
+                .chain(&[0, version])
+                .copied()
+                .collect::<Vec<_>>();
+            stream.write_all(&request).await.unwrap();
+
+            let mut response = vec![0; HS_OUT.len() + 2];
+            stream.read_exact(&mut response).await.unwrap();
+            response
+        });
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let result = auth(&mut stream).await;
+        (result, client.await.unwrap())
+    }
+
+    fn expected_handshake_response(version: u8) -> Vec<u8> {
+        HS_OUT
+            .iter()
+            .chain(&[0, version])
+            .copied()
+            .collect::<Vec<_>>()
+    }
+
+    #[tokio::test]
+    async fn current_protocol_version_authenticates() {
+        let (result, response) = authenticate_version(PROTOCOL_VERSION).await;
+
+        assert_eq!(result.unwrap(), PROTOCOL_VERSION);
+        assert_eq!(response, expected_handshake_response(PROTOCOL_VERSION));
+    }
+
+    #[tokio::test]
+    async fn previous_protocol_version_is_rejected_with_current_version_response() {
+        let previous_version = PROTOCOL_VERSION - 1;
+        let (result, response) = authenticate_version(previous_version).await;
+
+        match result {
+            Err(AuthError::HsUnexpectedProtocolVersion(expected, given)) => {
+                assert_eq!(expected, &[PROTOCOL_VERSION]);
+                assert_eq!(given, previous_version);
+            }
+            other => panic!("unexpected authentication result: {other:?}"),
+        }
+        assert_eq!(response, expected_handshake_response(PROTOCOL_VERSION));
     }
 
     #[test]
