@@ -46,6 +46,7 @@ pub struct Client {
     pub id: ClientID,
     pub connection: Connection,
     pub protocol: u8,
+    pub unicode_text: bool,
     tx_server: mpsc::Sender<MpscData>,
     tx_client: mpsc::Sender<Vec<u8>>,
     latest_server_time: LatestServerTimeSlot,
@@ -364,6 +365,7 @@ impl Client {
 
         let client = Self {
             protocol: 0,
+            unicode_text: false,
             id,
             connection: Connection::Connected,
             tx_server: tx,
@@ -726,6 +728,7 @@ mod tests {
                 id: 1,
                 connection: Connection::Connected,
                 protocol: PROTOCOL_VERSION,
+                unicode_text: false,
                 tx_server,
                 tx_client,
                 latest_server_time: Arc::new(Mutex::new(None)),

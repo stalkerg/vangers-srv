@@ -1,4 +1,5 @@
 use ::tracing::warn;
+use std::borrow::Cow;
 
 use crate::Server;
 use crate::client::ClientID;
@@ -29,16 +30,19 @@ impl OnUpdate_TotalPlayersDataQuery for Server {
         _packet: &Packet,
         client_id: ClientID,
     ) -> Result<OnUpdateOk, OnUpdateError> {
-        let game = match self.get_mut_game_by_clientid(client_id) {
+        let unicode = self.unicode_text(client_id);
+        let game = match self.get_game_by_clientid(client_id) {
             Some(game) => game,
             None => return Err(TotalPlayersDataQueryError::PlayerNotFound(client_id).into()),
         };
 
-        Ok(OnUpdateOk::Response(total_players_data_packet(game)))
+        Ok(OnUpdateOk::Response(total_players_data_packet(
+            game, unicode,
+        )))
     }
 }
 
-pub(super) fn total_players_data_packet(game: &Game) -> Packet {
+pub(super) fn total_players_data_packet(game: &Game, unicode: bool) -> Packet {
     let mut data = vec![(game.players.len() + game.removed_players.len()) as u8];
     let mut players_count = 0;
     for player in &game.players {
@@ -55,8 +59,8 @@ pub(super) fn total_players_data_packet(game: &Game) -> Packet {
         };
 
         let name = match player.auth {
-            Some(ref auth) => auth.name(),
-            None => b"[UNDEFINED]\0", // is it possible (?)
+            Some(ref auth) => auth.name_for(unicode),
+            None => Cow::Borrowed(&b"[UNDEFINED]\0"[..]), // is it possible (?)
         };
 
         let body = match player.body {
@@ -75,7 +79,7 @@ pub(super) fn total_players_data_packet(game: &Game) -> Packet {
             .chain(&[status])
             .chain(&[world])
             .chain(&player.pos.to_vangers_byte())
-            .chain(name)
+            .chain(name.iter())
             .chain(&body)
             .copied()
             .collect::<Vec<_>>();
@@ -86,12 +90,14 @@ pub(super) fn total_players_data_packet(game: &Game) -> Packet {
     }
 
     for player in &game.removed_players {
+        let name =
+            crate::network_text::name_for(&player.name, player.unicode_name.as_deref(), unicode);
         let mut p_data = std::iter::empty()
             .chain(&[player.bind_id])
             .chain(&[player.status as u8])
             .chain(&[player.world])
             .chain(&player.pos.to_vangers_byte())
-            .chain(&player.name)
+            .chain(name.iter())
             .chain(&player.body)
             .copied()
             .collect::<Vec<_>>();
@@ -130,6 +136,7 @@ mod tests {
             world: 0,
             pos: Pos { x: 10, y: 20 },
             name: b"gone\0".to_vec(),
+            unicode_name: None,
             body: Body::default().to_vangers_byte(),
         });
 

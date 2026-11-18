@@ -18,12 +18,23 @@ impl OnUpdate_ServerTimeQuery for Server {
     fn server_time_query(
         &mut self,
         packet: &Packet,
-        _client_id: ClientID,
+        client_id: ClientID,
     ) -> Result<OnUpdateOk, OnUpdateError> {
-        let data = (self.uptime() * 256).to_le_bytes();
+        let mut data = (self.uptime() * 256).to_le_bytes().to_vec();
+        let capability = crate::network_text::CAPABILITY;
+        if packet.data == capability && self.get_game_by_clientid(client_id).is_none() {
+            if let Some(client) = self
+                .clients
+                .iter_mut()
+                .find(|client| client.id == client_id)
+            {
+                client.unicode_text = true;
+                data.extend_from_slice(capability);
+            }
+        }
 
         packet
-            .create_answer(data.to_vec())
+            .create_answer(data)
             .map(OnUpdateOk::Response)
             .ok_or(OnUpdateError::ResponsePacketTypeNotExist(packet.action))
     }

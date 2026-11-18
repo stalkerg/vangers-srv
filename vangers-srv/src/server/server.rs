@@ -122,6 +122,12 @@ impl Server {
         // })
     }
 
+    pub(in crate::server) fn unicode_text(&self, client_id: ClientID) -> bool {
+        self.clients
+            .iter()
+            .any(|client| client.id == client_id && client.unicode_text)
+    }
+
     pub(in crate::server) fn get_game_by_clientid(&self, client_id: ClientID) -> Option<&Game> {
         self.games.get_game_by_client_id(client_id)
     }
