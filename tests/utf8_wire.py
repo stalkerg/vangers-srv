@@ -71,9 +71,17 @@ class Peer:
         self.id = reply[9]
         return struct.unpack("<I", reply[:4])[0]
 
+    def restore(self, game, station):
+        self.send(0x84, struct.pack("<IB", game, station))
+        assert self.receive(0xC4) == b"\x01"
+        self.id = station
+
     def register(self, name):
         self.send(0x88, name.encode(self.codec) + b"\x00password\x00")
         self.send(0x94, bytes(52))
+        # A reply on this TCP stream fences registration + body setup before
+        # peers issue roster requests on other connections.
+        self.roster()
 
     def say(self, text, *peers):
         self.send(0x95, struct.pack("<I", sum(1 << (p.id - 1) for p in peers)) +
@@ -152,10 +160,31 @@ def mixed_server(exe):
             # Forced clipping (client normally sends already width/byte-bounded rows).
             alice.say("x" * 135 + "日" + "abcdef", bob)
             bob.hears(alice, "x" * 135 + "...")
+
+            # The connection dies, but the station/name belongs to the game.
+            # The new connection must opt in again before restoring that station.
+            station = alice.id
+            alice.reset()
+            alice = Peer(port, offer=True, expect=True)
+            alice.restore(game, station)
+            alice.roster(name, "Éloïse", "Вангер")
+            alice.say("再接続 É", bob)
+            bob.hears(alice, "再接続 É")
+            bob.say("復帰", alice, legacy)
+            alice.hears(bob, "復帰")
+            legacy.hears(bob, "[UTF-8 message]")
+
+            # Mode is not inherited from the station when restoring without opt-in.
+            alice.reset()
+            alice = Peer(port, offer=False, expect=False)
+            alice.restore(game, station)
+            alice.roster(f"Vanger-{station}", f"Vanger-{bob.id}", "Вангер")
+            alice.say("Привет", bob)
+            bob.hears(alice, "Привет")
         finally:
             for peer in (legacy, bob, alice):
                 peer.reset()
-    print("new server: new/new and mixed names, roster, chat and scalar boundaries OK")
+    print("new server: new/new and mixed names, roster, chat, scalar boundaries and reconnect OK")
 
 if __name__ == "__main__":
     mixed_server(sys.argv[1])
