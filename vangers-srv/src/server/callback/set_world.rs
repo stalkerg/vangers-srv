@@ -42,6 +42,7 @@ impl OnUpdate_SetWorld for Server {
         packet: &Packet,
         client_id: ClientID,
     ) -> Result<OnUpdateOk, OnUpdateError> {
+        let unicode = self.unicode_text(client_id);
         let world_id = packet.data[0];
         let world_y_size = slice_le_to_i16(&packet.data[1..3]);
 
@@ -137,7 +138,7 @@ impl OnUpdate_SetWorld for Server {
                 Packet::new(Action::PLAYERS_WORLD, &[player_bind_id, world_id]);
             let set_world_response = packet.create_answer(vec![world_id, world_status]).unwrap();
             let snapshot_begin = Packet::new(Action::WORLD_SNAPSHOT_BEGIN, &[world_id]);
-            let players_snapshot = total_players_data_packet(game);
+            let players_snapshot = total_players_data_packet(game, unicode);
             let snapshot_end = Packet::new(Action::WORLD_SNAPSHOT_END, &[world_id]);
 
             (

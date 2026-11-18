@@ -7,6 +7,7 @@ use ::tracing::info;
 
 use crate::Server;
 use crate::client::ClientID;
+use crate::player::Auth;
 use crate::protocol::Packet;
 
 use super::{OnUpdateError, OnUpdateOk};
@@ -21,6 +22,8 @@ pub enum RegisterNameError {
     PlayerNotBind(ClientID),
     #[error("request to set empty name")]
     NameIsNull,
+    #[error("invalid Unicode name")]
+    InvalidUnicodeName,
 }
 
 #[allow(non_camel_case_types)]
@@ -39,6 +42,7 @@ impl OnUpdate_RegisterName for Server {
         packet: &Packet,
         client_id: ClientID,
     ) -> Result<OnUpdateOk, OnUpdateError> {
+        let unicode = self.unicode_text(client_id);
         let player = self
             .games
             .get_mut_player_by_client_id(client_id)
@@ -49,39 +53,67 @@ impl OnUpdate_RegisterName for Server {
             .map(|bind| bind.id())
             .ok_or(RegisterNameError::PlayerNotBind(client_id))?;
 
-        let (login, pwd) = extract_auth_data(&packet.data)?;
+        let auth = if unicode {
+            let (name, pwd) = split_auth_data(&packet.data)?;
+            let name = name
+                .to_str()
+                .map_err(|_| RegisterNameError::InvalidUnicodeName)?;
+            let name = crate::network_text::single_line(name);
+            let end = name
+                .char_indices()
+                .nth(16)
+                .map_or(name.len(), |(index, _)| index);
+            Auth::new_unicode(&name[..end], pwd.to_bytes_with_nul(), player_bind_id)
+        } else {
+            let (login, pwd) = extract_auth_data(&packet.data)?;
+            Auth::new(login.to_bytes_with_nul(), pwd.to_bytes_with_nul())
+        };
+        let packet_for = |unicode| {
+            let name = auth.name_for(unicode);
+            let mut data = vec![player_bind_id];
+            data.extend_from_slice(&name);
+            packet
+                .create_answer(data)
+                .expect("REGISTER_NAME has a response")
+        };
+        let legacy_packet = packet_for(false);
+        let unicode_packet = packet_for(true);
+        info!("set name {:?} for player_id=`{}`", auth, player_bind_id);
+        player.auth = Some(auth);
 
-        player.set_auth(login.to_bytes_with_nul(), pwd.to_bytes_with_nul());
-        info!("set name {:?} for player_id=`{}`", login, player_bind_id);
-
-        let data = std::iter::empty()
-            .chain(&player_bind_id.to_le_bytes())
-            .chain(login.to_bytes_with_nul())
-            .copied()
-            .collect::<Vec<_>>();
-
-        let answer = packet.create_answer(data).unwrap();
-        self.notify_game(client_id, &answer);
+        if let Some(game) = self.get_game_by_clientid(client_id) {
+            for peer in &game.players {
+                if peer.client_id == client_id {
+                    continue;
+                }
+                if let Some(client) = self.clients.iter().find(|c| c.id == peer.client_id) {
+                    client.send(if client.unicode_text {
+                        &unicode_packet
+                    } else {
+                        &legacy_packet
+                    });
+                }
+            }
+        }
 
         Ok(OnUpdateOk::Complete)
     }
 }
 
-fn extract_auth_data<'a>(data: &'a [u8]) -> Result<(Cow<'a, CStr>, &'a CStr), RegisterNameError> {
-    let mut name = Cow::Borrowed(
-        CStr::from_bytes_until_nul(data).map_err(|_| RegisterNameError::NameOrPasswordParse)?,
-    );
-
+fn split_auth_data(data: &[u8]) -> Result<(&CStr, &CStr), RegisterNameError> {
+    let name =
+        CStr::from_bytes_until_nul(data).map_err(|_| RegisterNameError::NameOrPasswordParse)?;
     if name.is_empty() {
-        Err(RegisterNameError::NameIsNull)?
+        return Err(RegisterNameError::NameIsNull);
     }
-
-    if data.len() <= name.to_bytes_with_nul().len() {
-        Err(RegisterNameError::NameOrPasswordParse)?
-    }
-
     let pwd = CStr::from_bytes_until_nul(&data[name.to_bytes_with_nul().len()..])
         .map_err(|_| RegisterNameError::NameOrPasswordParse)?;
+    Ok((name, pwd))
+}
+
+fn extract_auth_data(data: &[u8]) -> Result<(Cow<'_, CStr>, &CStr), RegisterNameError> {
+    let (name, pwd) = split_auth_data(data)?;
+    let mut name = Cow::Borrowed(name);
 
     {
         // TODO: create auth service and checks for correct pwd here

@@ -5,6 +5,7 @@ use ::tracing_subscriber::EnvFilter;
 
 mod client;
 mod game;
+mod network_text;
 mod player;
 mod protocol;
 mod server;

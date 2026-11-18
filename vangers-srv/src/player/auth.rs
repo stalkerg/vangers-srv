@@ -1,11 +1,10 @@
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::CString;
 use std::{
     fmt::Debug,
     hash::{Hash, Hasher},
 };
-
-use crate::utils::convert_cp866_to_utf8;
 
 fn get_hash_pwd(pwd: &[u8]) -> u64 {
     // TODO: use more secure algorithm to hashing passwords
@@ -16,6 +15,7 @@ fn get_hash_pwd(pwd: &[u8]) -> u64 {
 
 pub struct Auth {
     name: Vec<u8>,
+    unicode_name: Option<Vec<u8>>,
     #[allow(dead_code)]
     pwd: Option<u64>,
 }
@@ -41,15 +41,38 @@ impl Auth {
             None
         };
 
-        Self { name, pwd }
+        Self {
+            name,
+            unicode_name: None,
+            pwd,
+        }
     }
 
     pub fn name(&self) -> &[u8] {
         &self.name
     }
 
+    pub fn new_unicode(name: &str, pwd: &[u8], bind_id: u8) -> Self {
+        let alias = format!("Vanger-{bind_id}");
+        let legacy = crate::network_text::project_legacy(name, 16, &alias);
+        let mut auth = Self::new(&legacy, pwd);
+        let mut utf8 = name.as_bytes().to_vec();
+        utf8.push(0);
+        auth.unicode_name = Some(utf8);
+        auth
+    }
+
+    pub fn name_for(&self, unicode: bool) -> Cow<'_, [u8]> {
+        crate::network_text::name_for(&self.name, self.unicode_name.as_deref(), unicode)
+    }
+
+    pub fn unicode_name(&self) -> Option<&[u8]> {
+        self.unicode_name.as_deref()
+    }
+
     pub fn name_utf8(&self) -> String {
-        convert_cp866_to_utf8(&self.name[..self.name.len() - 1]).unwrap_or("unknown".to_string())
+        let bytes = self.name_for(true);
+        String::from_utf8_lossy(&bytes[..bytes.len() - 1]).into_owned()
     }
 }
 

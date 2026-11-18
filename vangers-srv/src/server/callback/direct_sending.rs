@@ -1,12 +1,7 @@
-use std::borrow::Cow;
-use std::io::Write;
-
-use tracing::warn;
-
 use crate::client::ClientID;
 use crate::protocol::Packet;
-use crate::utils;
 use crate::{Server, player::Player};
+use crate::{network_text, utils};
 
 use super::{OnUpdateError, OnUpdateOk};
 
@@ -16,6 +11,8 @@ pub enum DirectSendingError {
     Parse,
     #[error("cannot parse c-string")]
     String,
+    #[error("invalid UTF-8 direct message")]
+    InvalidUnicode,
     #[error("client with client_id=`{0}` is out of all games")]
     ClientIsOutOfGames(ClientID),
     #[error("player with client_id=`{0}` is not found in game_id=`{1}`")]
@@ -80,40 +77,23 @@ impl OnUpdate_DirectSending for Server {
             Err(DirectSendingError::String)?
         };
 
-        let mut msg = Cow::Borrowed(msg);
-
-        // TODO: take out to config this constant
-        const LIMIT_MSG_LEN: usize = 140;
-        if msg.len() > LIMIT_MSG_LEN {
-            warn!(
-                "direct message length is too big, max length: `{}`, given length: `{}`, the message will be cut",
-                LIMIT_MSG_LEN,
-                msg.len()
-            );
-            msg = Cow::Owned({
-                let mut buffer = Vec::with_capacity(LIMIT_MSG_LEN);
-                buffer.write_all(&msg[0..LIMIT_MSG_LEN - 3 - 1]).ok();
-                buffer.write_all(b"...").ok();
-                buffer.push(0);
-                buffer
-            })
-        }
-
-        let data = std::iter::empty()
-            .chain(&[player_id])
-            .chain(&msg[..])
-            .copied()
-            .collect::<Vec<_>>();
-
-        let answer = match packet.create_answer(data) {
-            Some(packet) => packet,
-            None => return Err(OnUpdateError::ResponsePacketTypeNotExist(packet.action)),
+        let unicode = self.unicode_text(client_id);
+        let (legacy, utf8) =
+            network_text::chat_for_modes(msg, unicode).ok_or(DirectSendingError::InvalidUnicode)?;
+        let answer = |msg: &[u8]| {
+            let mut bytes = vec![player_id];
+            bytes.extend_from_slice(msg);
+            packet
+                .create_answer(bytes)
+                .expect("DIRECT_SENDING has a response")
         };
+        let legacy = answer(&legacy);
+        let utf8 = answer(&utf8);
 
         self.clients
-            .iter_mut()
+            .iter()
             .filter(|c| client_ids.contains(&c.id))
-            .for_each(|c| c.send(&answer));
+            .for_each(|c| c.send(if c.unicode_text { &utf8 } else { &legacy }));
 
         Ok(OnUpdateOk::Complete)
     }

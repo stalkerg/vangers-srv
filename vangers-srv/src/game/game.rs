@@ -242,13 +242,16 @@ pub struct RemovedPlayer {
     pub world: u8,
     pub pos: Pos<i16>,
     pub name: Vec<u8>,
+    pub unicode_name: Option<Vec<u8>>,
     pub body: Vec<u8>,
 }
 
 impl RemovedPlayer {
     pub fn from_player(player: &Player) -> Option<Self> {
         let bind_id = player.bind.map(|bind| bind.id())?;
-        let name = player.auth.as_ref()?.name().to_vec();
+        let auth = player.auth.as_ref()?;
+        let name = auth.name().to_vec();
+        let unicode_name = auth.unicode_name().map(<[u8]>::to_vec);
         let body = player.body.as_ref()?.to_vangers_byte();
         let world = player
             .world
@@ -262,6 +265,7 @@ impl RemovedPlayer {
             world,
             pos: player.pos,
             name,
+            unicode_name,
             body,
         })
     }
